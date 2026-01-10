@@ -1,0 +1,13 @@
+[Unit]
+Description=Roaring routes daemon (vm_* -> Astro target)
+After=pipewire-pulse.service wireplumber.service roaring-vm-sinks.service
+Wants=pipewire-pulse.service wireplumber.service roaring-vm-sinks.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/roaring_audio_routesd.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

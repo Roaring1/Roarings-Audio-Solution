@@ -1,0 +1,12 @@
+[Unit]
+Description=VMPW loopbacks (Voicemeeter-ish)
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/vmpw --init
+Environment=LATENCY_MS=10
+
+[Install]
+WantedBy=default.target

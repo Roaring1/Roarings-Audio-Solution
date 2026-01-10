@@ -1,0 +1,13 @@
+[Unit]
+Description=LPD8 mixer (VM buses + Astro target control)
+After=pipewire-pulse.service wireplumber.service roaring-audio-routesd.service
+Wants=roaring-audio-routesd.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/lpd8_mixer.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

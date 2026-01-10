@@ -1,0 +1,13 @@
+[Unit]
+Description=Roaring VM sinks (vm_game/vm_chat/vm_music)
+After=pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/roaring_vm_sinks.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

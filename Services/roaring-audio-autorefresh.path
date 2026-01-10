@@ -1,0 +1,17 @@
+# 10/1/2026-1
+# Summary:
+# - Watches key scripts and triggers the oneshot autorefresh service when they change.
+
+[Unit]
+Description=Roaring audio autorefresh (watch scripts)
+
+[Path]
+PathChanged=%h/bin/roaring_audio_routesd.sh
+PathChanged=%h/bin/roaring_vm_sinks.sh
+PathChanged=%h/bin/roaring_mic_bussesd.sh
+PathChanged=%h/bin/roaring_mic_routesd.sh
+PathChanged=%h/bin/lpd8_mixer.sh
+Unit=roaring-audio-autorefresh.service
+
+[Install]
+WantedBy=default.target

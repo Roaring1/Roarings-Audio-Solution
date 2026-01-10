@@ -1,0 +1,10 @@
+# 10/1/2026-1
+# Summary:
+# - Oneshot restart using the same restart script (soft mode) when scripts change.
+
+[Unit]
+Description=Roaring audio autorefresh (restart services after script changes)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/roaring_restart_everything.sh --soft

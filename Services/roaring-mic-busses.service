@@ -1,0 +1,13 @@
+[Unit]
+Description=Roaring Mic B1/B2 virtual busses (PipeWire-Pulse)
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/bin/roaring_mic_bussesd.sh
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

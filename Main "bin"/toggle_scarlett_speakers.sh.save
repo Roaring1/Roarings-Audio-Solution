@@ -1,0 +1,22 @@
+FOCUSRITE_SINK="alsa_output.usb-Focusrite_Scarlett_Solo_USB_Y7XZGYX15C77AB-00.Direct__Direct__sink"
+#!/usr/bin/env bash
+set -euo pipefail
+
+FOCUSRITE_SINK="alsa_output.usb-Focusrite_Scarlett_Solo_USB_Y7XZGYX15C77AB-00.Direct__Direct__sink"
+STATE="$HOME/.cache/roaring_scarlett_loopbacks"
+
+if [[ -f "$STATE" ]]; then
+  while read -r id; do
+    [[ -n "$id" ]] && pactl unload-module "$id" >/dev/null 2>&1 || true
+  done < "$STATE"
+  rm -f "$STATE"
+  echo "Scarlett speakers mirror: OFF"
+else
+  : > "$STATE"
+  # Higher latency here = more stable when mirroring to a second hardware clock.
+  for src in vm_game.monitor vm_chat.monitor vm_music.monitor; do
+    id="$(pactl load-module module-loopback source="$src" sink="$FOCUSRITE_SINK" latency_msec=40)"
+    echo "$id" >> "$STATE"
+  done
+  echo "Scarlett speakers mirror: ON"
+fi
