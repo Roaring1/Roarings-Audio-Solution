@@ -1,0 +1,16 @@
+[Unit]
+Description=Roaring LPD8 debug listener (pad -> debug dump)
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bash -lc 'exec %h/bin/roaring_lpd8_debug_listener.sh'
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=15
+
+[Install]
+WantedBy=default.target

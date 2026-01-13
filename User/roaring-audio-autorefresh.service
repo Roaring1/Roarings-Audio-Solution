@@ -1,0 +1,6 @@
+[Unit]
+Description=Roaring audio autorefresh (restart services after script changes)
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/roaring_restart_everything.sh --soft --no-disable-autorefresh

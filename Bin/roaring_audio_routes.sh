@@ -7,12 +7,17 @@ set -euo pipefail
 #          Removes duplicates/wrong-target loopbacks to prevent phase/3D audio.
 
 CONF="$HOME/.config/roaring_mixer.conf"
-LOG="$HOME/.cache/roaring-audio-routesd.log"
+LOG="$HOME/.cache/roaring-audio-routes.log"
 mkdir -p "$HOME/.cache"
 exec >>"$LOG" 2>&1
 
 log() { echo "[routesd] $(date +%H:%M:%S) $*"; }
 wait_for_pactl() { until pactl info >/dev/null 2>&1; do sleep 0.2; done; }
+
+if systemctl --user is-active -q roaring-audio-routesd.service 2>/dev/null; then
+  log "routesd active; exiting to avoid duplicate loopback management."
+  exit 0
+fi
 
 sink_exists()   { pactl list short sinks   2>/dev/null | awk '{print $2}' | grep -qx "$1"; }
 source_exists() { pactl list short sources 2>/dev/null | awk '{print $2}' | grep -qx "$1"; }

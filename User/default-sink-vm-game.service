@@ -1,0 +1,10 @@
+[Unit]
+Description=Force default PipeWire sink to VM-GAME
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wpctl set-default 40
+
+[Install]
+WantedBy=default.target

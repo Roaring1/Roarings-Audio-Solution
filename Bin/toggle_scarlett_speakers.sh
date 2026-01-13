@@ -6,6 +6,13 @@ set -euo pipefail
 
 STATE="$HOME/.cache/roaring_scarlett_loopbacks"
 
+# If state exists but modules are gone (pipewire restart), drop stale state
+if [[ -f "$STATE" ]]; then
+  if ! pactl list short modules 2>/dev/null | awk '{print $1}' | grep -qf "$STATE"; then
+    rm -f "$STATE"
+  fi
+fi
+
 notify() {
   command -v notify-send >/dev/null 2>&1 || return 0
   notify-send "Roaring Scarlett Mirror" "$*"

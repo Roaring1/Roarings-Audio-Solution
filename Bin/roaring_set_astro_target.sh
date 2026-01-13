@@ -6,6 +6,7 @@ set -euo pipefail
 
 CFG_DIR="$HOME/.config/roaring_audio"
 CFG_FILE="$CFG_DIR/astro_target"
+MIXER_CONF="$HOME/.config/roaring_mixer.conf"
 mkdir -p "$CFG_DIR"
 
 ASTRO_GAME="alsa_output.usb-Astro_Gaming_Astro_A50-00.stereo-game"
@@ -32,6 +33,15 @@ case "$mode" in
 esac
 
 echo "$target" > "$CFG_FILE"
+
+mkdir -p "$(dirname "$MIXER_CONF")"
+touch "$MIXER_CONF"
+if grep -qE '^ASTRO_TARGET=' "$MIXER_CONF"; then
+  sed -i "s|^ASTRO_TARGET=.*|ASTRO_TARGET=\"$target\"|g" "$MIXER_CONF"
+else
+  echo "ASTRO_TARGET=\"$target\"" >> "$MIXER_CONF"
+fi
+
 echo "[astro] target set to: $target"
 
 systemctl --user restart roaring-audio-routesd.service >/dev/null 2>&1 || true

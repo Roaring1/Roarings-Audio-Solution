@@ -1,0 +1,14 @@
+Carla is the audio app I chose.
+Carla is the best application I could find. it has everything I needed for my mic.
+
+
+The file to import --> CarlaProject_Roaring.carxp
+The scripts need to be edited, based on where you place the carxp file.
+
+In my service-- "roaring-carla-session.service":
+
+
+ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp"'
+
+
+.. Here, Carla's saved at "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp" .. edit the file to be what you want.

@@ -1,7 +1,3 @@
-# 10/1/2026-1
-# Summary:
-# - Watches key scripts and triggers the oneshot autorefresh service when they change.
-
 [Unit]
 Description=Roaring audio autorefresh (watch scripts)
 

@@ -3,11 +3,11 @@ set -euo pipefail
 
 # 9/1/2026-6
 # Summary: Ensures vm_game/vm_chat/vm_music virtual sinks ALWAYS exist,
-#          and enforces EXACTLY 3 loopbacks (vm_*.monitor -> Astro target).
+#          and ensures loopbacks (vm_*.monitor -> Astro target) without unload thrash.
 #          Also supports toggling Astro target (CHAT <-> GAME) via config file.
 
 CONF="$HOME/.config/roaring_mixer.conf"
-LOG="$HOME/.cache/roaring-audio-stackd.log"
+LOG="$HOME/.cache/roaring-audio-stack.log"
 mkdir -p "$HOME/.cache"
 
 # trim log
@@ -16,7 +16,15 @@ if [[ -f "$LOG" ]] && [[ "$(wc -c < "$LOG")" -gt 1048576 ]]; then
 fi
 exec >>"$LOG" 2>&1
 
+DEDUP_INTERVAL_SEC=15
+
 log() { echo "[stackd] $(date +%H:%M:%S) $*"; }
+now_sec() { date +%s; }
+
+if systemctl --user is-active -q roaring-audio-stackd.service 2>/dev/null; then
+  log "stackd active; exiting to avoid duplicate loopback management."
+  exit 0
+fi
 
 SINK_GAME="vm_game"
 SINK_CHAT="vm_chat"
@@ -58,41 +66,51 @@ ensure_vm_sink() {
   return 1
 }
 
-unload_vm_loopbacks_all() {
-  pactl list short modules 2>/dev/null | awk '
-    $2=="module-loopback" &&
-    ($0 ~ /source=vm_game\.monitor/ || $0 ~ /source=vm_chat\.monitor/ || $0 ~ /source=vm_music\.monitor/)
-    {print $1}
-  ' | while read -r id; do
-    [[ -n "${id:-}" ]] || continue
-    pactl unload-module "$id" >/dev/null 2>&1 || true
+loopback_exists() {
+  local src="$1" sink="$2"
+  pactl list short modules 2>/dev/null \
+    | awk '$2=="module-loopback" && $0 ~ ("source=" s) && $0 ~ ("sink=" k) {found=1} END{exit(found?0:1)}' \
+      s="$src" k="$sink"
+}
+
+ensure_loopback() {
+  local src="$1" sink="$2" latency="$3"
+  if loopback_exists "$src" "$sink"; then
+    return 0
+  fi
+
+  pactl load-module module-loopback source="$src" sink="$sink" latency_msec="$latency" >/dev/null 2>&1 || true
+  if loopback_exists "$src" "$sink"; then
+    log "created loopback: source=$src -> sink=$sink (latency=${latency}ms)"
+  else
+    log "FAILED create loopback: source=$src -> sink=$sink"
+  fi
+}
+
+_last_dedupe_sec=0
+dedupe_loopbacks_for_target() {
+  local target="$1"
+  local t; t="$(now_sec)"
+  (( t - _last_dedupe_sec < DEDUP_INTERVAL_SEC )) && return 0
+  _last_dedupe_sec="$t"
+
+  local src
+  for src in vm_game.monitor vm_chat.monitor vm_music.monitor; do
+    mapfile -t ids < <(pactl list short modules 2>/dev/null | awk -v s="$src" -v k="$target" '
+      $2=="module-loopback" && $0 ~ ("source=" s) && $0 ~ ("sink=" k) {print $1}
+    ')
+    if (( ${#ids[@]} > 1 )); then
+      local keep="${ids[0]}"
+      local id
+      for id in "${ids[@]:1}"; do
+        pactl unload-module "$id" >/dev/null 2>&1 || true
+      done
+      log "dedupe: kept $keep for $src -> $target (removed $(( ${#ids[@]} - 1 )))"
+    fi
   done
 }
 
-count_loopbacks_to_target() {
-  local target="$1"
-  pactl list short modules 2>/dev/null | awk -v t="$target" '
-    $2=="module-loopback" && $0 ~ ("sink=" t) &&
-    ($0 ~ /source=vm_game\.monitor/ || $0 ~ /source=vm_chat\.monitor/ || $0 ~ /source=vm_music\.monitor/)
-    {c++}
-    END{print c+0}
-  '
-}
-
-have_one_each() {
-  local target="$1"
-
-  pactl list short modules 2>/dev/null | grep -q "module-loopback source=vm_game.monitor sink=$target" || return 1
-  pactl list short modules 2>/dev/null | grep -q "module-loopback source=vm_chat.monitor sink=$target" || return 1
-  pactl list short modules 2>/dev/null | grep -q "module-loopback source=vm_music.monitor sink=$target" || return 1
-
-  # also ensure there are exactly 3 vm loopbacks to that target
-  local c
-  c="$(count_loopbacks_to_target "$target")"
-  [[ "$c" -eq 3 ]]
-}
-
-ensure_exact_three_loopbacks() {
+ensure_loopbacks() {
   local target="$1"
   local latency="$2"
 
@@ -102,22 +120,10 @@ ensure_exact_three_loopbacks() {
   source_exists "vm_chat.monitor"  || return 0
   source_exists "vm_music.monitor" || return 0
 
-  if have_one_each "$target"; then
-    return 0
-  fi
-
-  log "rebuild loopbacks: target=$target latency=${latency}ms"
-  unload_vm_loopbacks_all
-
-  pactl load-module module-loopback source="vm_game.monitor"  sink="$target" latency_msec="$latency" >/dev/null 2>&1 || true
-  pactl load-module module-loopback source="vm_chat.monitor"  sink="$target" latency_msec="$latency" >/dev/null 2>&1 || true
-  pactl load-module module-loopback source="vm_music.monitor" sink="$target" latency_msec="$latency" >/dev/null 2>&1 || true
-
-  if have_one_each "$target"; then
-    log "ok"
-  else
-    log "FAILED to enforce exact three loopbacks"
-  fi
+  ensure_loopback "vm_game.monitor"  "$target" "$latency"
+  ensure_loopback "vm_chat.monitor"  "$target" "$latency"
+  ensure_loopback "vm_music.monitor" "$target" "$latency"
+  dedupe_loopbacks_for_target "$target"
 }
 
 main() {
@@ -131,7 +137,7 @@ main() {
     ensure_vm_sink "$SINK_CHAT"  "$DESC_CHAT"  || true
     ensure_vm_sink "$SINK_MUSIC" "$DESC_MUSIC" || true
 
-    ensure_exact_three_loopbacks "$ASTRO_TARGET" "$LATENCY_MSEC" || true
+    ensure_loopbacks "$ASTRO_TARGET" "$LATENCY_MSEC" || true
     sleep 1
   done
 }

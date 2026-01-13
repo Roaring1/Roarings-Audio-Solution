@@ -1,0 +1,18 @@
+[Unit]
+Description=Roaring Carla session (auto-load carxp)
+After=graphical-session.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=graphical-session.target pipewire-pulse.service wireplumber.service
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/bash -lc 'until pactl info >/dev/null 2>&1; do sleep 0.2; done'
+ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp"'
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=60
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=default.target

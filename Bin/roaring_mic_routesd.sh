@@ -16,6 +16,8 @@ mkdir -p "$HOME/.cache"
 exec >>"$LOG" 2>&1
 
 log() { echo "[mic-routesd] $(date +%H:%M:%S) $*"; }
+DEDUP_INTERVAL_SEC=15
+now_sec() { date +%s; }
 wait_for_pactl() { until pactl info >/dev/null 2>&1; do sleep 0.2; done; }
 
 sink_exists()   { pactl list short sinks   2>/dev/null | awk '{print $2}' | grep -qx "$1"; }
@@ -23,7 +25,7 @@ source_exists() { pactl list short sources 2>/dev/null | awk '{print $2}' | grep
 
 load_conf() {
   B1_ROUTE="astro"
-  B2_ROUTE="sm7b"
+  B2_ROUTE="none"
   LATENCY_MSEC="10"
   RATE="48000"
   [[ -f "$CONF" ]] && source "$CONF" || true
@@ -64,39 +66,54 @@ want_contains() {
   [[ "$want" == "$needle" || "$want" == "both" ]]
 }
 
-# returns lines of module IDs for mic route loopbacks we manage
-list_managed_route_loopbacks() {
-  pactl list short modules 2>/dev/null | awk '
-    $2=="module-loopback" &&
-    ($0 ~ /source=sm7b_mono/ || $0 ~ /source=astro_mic_48k/) &&
-    ($0 ~ /sink=mic_b1/ || $0 ~ /sink=mic_b2/)
-    {print $1}
-  '
-}
-
-# returns count for a specific (source,sink) loopback
-count_loopback() {
+loopback_ids_for_pair() {
   local src="$1" sink="$2"
   pactl list short modules 2>/dev/null | awk -v s="$src" -v k="$sink" '
-    $2=="module-loopback" && $0 ~ ("source=" s) && $0 ~ ("sink=" k) {c++}
-    END{print c+0}
+    $2=="module-loopback" && $0 ~ ("source=" s) && $0 ~ ("sink=" k) {print $1}
   '
 }
 
-unload_managed_route_loopbacks() {
-  list_managed_route_loopbacks | while read -r id; do
+loopback_exists() {
+  local src="$1" sink="$2"
+  loopback_ids_for_pair "$src" "$sink" | head -n 1 | grep -q .
+}
+
+unload_loopbacks_for_pair() {
+  local src="$1" sink="$2"
+  loopback_ids_for_pair "$src" "$sink" | while read -r id; do
     [[ -n "${id:-}" ]] || continue
     pactl unload-module "$id" >/dev/null 2>&1 || true
   done
 }
 
-load_loopback() {
+ensure_loopback() {
   local src="$1" sink="$2" latency="$3" rate="$4"
+  if loopback_exists "$src" "$sink"; then
+    return 0
+  fi
   pactl load-module module-loopback \
     source="$src" sink="$sink" \
     latency_msec="$latency" rate="$rate" \
     channels=2 channel_map=front-left,front-right remix=yes \
     source_dont_move=true sink_dont_move=true >/dev/null 2>&1 || true
+}
+
+_last_dedupe_sec=0
+dedupe_loopbacks_for_pair() {
+  local src="$1" sink="$2"
+  local t; t="$(now_sec)"
+  (( t - _last_dedupe_sec < DEDUP_INTERVAL_SEC )) && return 0
+  _last_dedupe_sec="$t"
+
+  mapfile -t ids < <(loopback_ids_for_pair "$src" "$sink")
+  if (( ${#ids[@]} > 1 )); then
+    local keep="${ids[0]}"
+    local id
+    for id in "${ids[@]:1}"; do
+      pactl unload-module "$id" >/dev/null 2>&1 || true
+    done
+    log "dedupe: kept $keep for $src -> $sink (removed $(( ${#ids[@]} - 1 )))"
+  fi
 }
 
 ensure_routes_exact() {
@@ -117,24 +134,33 @@ ensure_routes_exact() {
   want_contains "$B2_ROUTE" "sm7b"  && want_sm7b_b2=1
   want_contains "$B2_ROUTE" "astro" && want_astro_b2=1
 
-  # Check if current set already matches exactly (each desired loopback count ==1 and undesired ==0)
-  local ok=1
-  [[ "$(count_loopback sm7b_mono mic_b1)"  -eq "$want_sm7b_b1"  ]] || ok=0
-  [[ "$(count_loopback astro_mic_48k mic_b1)" -eq "$want_astro_b1" ]] || ok=0
-  [[ "$(count_loopback sm7b_mono mic_b2)"  -eq "$want_sm7b_b2"  ]] || ok=0
-  [[ "$(count_loopback astro_mic_48k mic_b2)" -eq "$want_astro_b2" ]] || ok=0
-
-  if [[ "$ok" -eq 1 ]]; then
-    return 0
+  if [[ "$want_sm7b_b1" -eq 1 ]]; then
+    ensure_loopback sm7b_mono mic_b1 "$LATENCY_MSEC" "$RATE"
+    dedupe_loopbacks_for_pair sm7b_mono mic_b1
+  else
+    unload_loopbacks_for_pair sm7b_mono mic_b1
   fi
 
-  log "rebuild routes: B1_ROUTE=$B1_ROUTE B2_ROUTE=$B2_ROUTE latency=${LATENCY_MSEC}ms rate=${RATE}"
-  unload_managed_route_loopbacks
+  if [[ "$want_astro_b1" -eq 1 ]]; then
+    ensure_loopback astro_mic_48k mic_b1 "$LATENCY_MSEC" "$RATE"
+    dedupe_loopbacks_for_pair astro_mic_48k mic_b1
+  else
+    unload_loopbacks_for_pair astro_mic_48k mic_b1
+  fi
 
-  if [[ "$want_sm7b_b1" -eq 1 ]]; then load_loopback sm7b_mono mic_b1 "$LATENCY_MSEC" "$RATE"; fi
-  if [[ "$want_astro_b1" -eq 1 ]]; then load_loopback astro_mic_48k mic_b1 "$LATENCY_MSEC" "$RATE"; fi
-  if [[ "$want_sm7b_b2" -eq 1 ]]; then load_loopback sm7b_mono mic_b2 "$LATENCY_MSEC" "$RATE"; fi
-  if [[ "$want_astro_b2" -eq 1 ]]; then load_loopback astro_mic_48k mic_b2 "$LATENCY_MSEC" "$RATE"; fi
+  if [[ "$want_sm7b_b2" -eq 1 ]]; then
+    ensure_loopback sm7b_mono mic_b2 "$LATENCY_MSEC" "$RATE"
+    dedupe_loopbacks_for_pair sm7b_mono mic_b2
+  else
+    unload_loopbacks_for_pair sm7b_mono mic_b2
+  fi
+
+  if [[ "$want_astro_b2" -eq 1 ]]; then
+    ensure_loopback astro_mic_48k mic_b2 "$LATENCY_MSEC" "$RATE"
+    dedupe_loopbacks_for_pair astro_mic_48k mic_b2
+  else
+    unload_loopbacks_for_pair astro_mic_48k mic_b2
+  fi
 }
 
 main() {

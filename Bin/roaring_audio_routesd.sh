@@ -4,19 +4,34 @@ set -euo pipefail
 # 10/1/2026-2
 # Summary:
 # - Keeps VM audio routed to your Astro target using module-loopback.
-# - NEVER unloads modules (PipeWire-Pulse can deny UNLOAD_MODULE and cause thrash).
-# - Only ensures the 3 loopbacks exist: vm_game/chat/music.monitor -> ASTRO_TARGET.
+# - Only unloads VM loopbacks when the target changes (best-effort).
+# - Ensures the 3 loopbacks exist: vm_game/chat/music.monitor -> ASTRO_TARGET.
 # - Auto-detects ASTRO_TARGET if not explicitly set.
 
 LOG="$HOME/.cache/roaring-audio-routesd.log"
 mkdir -p "$HOME/.cache"
 exec >>"$LOG" 2>&1
 
-LATENCY_MSEC="${LATENCY_MSEC:-40}"
-ASTRO_TARGET="${ASTRO_TARGET:-}"          # optional override (sink name)
-ASTRO_MATCH_RE="${ASTRO_MATCH_RE:-Astro}" # used only if ASTRO_TARGET is empty
+CONF="$HOME/.config/roaring_mixer.conf"
+STATE_FILE="$HOME/.cache/roaring-audio-routesd.target"
+
+ENV_LATENCY_MSEC="${LATENCY_MSEC:-40}"
+ENV_ASTRO_TARGET="${ASTRO_TARGET:-}"          # optional override (sink name)
+ENV_ASTRO_MATCH_RE="${ASTRO_MATCH_RE:-Astro}" # used only if ASTRO_TARGET is empty
+DEDUP_INTERVAL_SEC=15
 
 log() { echo "[audio-routesd] $(date +%H:%M:%S) $*"; }
+now_sec() { date +%s; }
+
+load_conf() {
+  LATENCY_MSEC="$ENV_LATENCY_MSEC"
+  ASTRO_TARGET="$ENV_ASTRO_TARGET"
+  ASTRO_MATCH_RE="$ENV_ASTRO_MATCH_RE"
+  if [[ -f "$CONF" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+  fi
+}
 
 wait_for_pactl() {
   local i=0
@@ -33,6 +48,18 @@ wait_for_pactl() {
 sink_exists() {
   local name="$1"
   pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -qx "$name"
+}
+
+unload_vm_loopbacks_to_sink() {
+  local sink="$1"
+  pactl list short modules 2>/dev/null | awk -v k="$sink" '
+    $2=="module-loopback" &&
+    ($0 ~ /source=vm_game\.monitor/ || $0 ~ /source=vm_chat\.monitor/ || $0 ~ /source=vm_music\.monitor/) &&
+    $0 ~ ("sink=" k) {print $1}
+  ' | while read -r id; do
+    [[ -n "${id:-}" ]] || continue
+    pactl unload-module "$id" >/dev/null 2>&1 || true
+  done
 }
 
 find_astro_target() {
@@ -111,10 +138,35 @@ ensure_loopback() {
   fi
 }
 
+_last_dedupe_sec=0
+dedupe_loopbacks_for_target() {
+  local target="$1"
+  local t; t="$(now_sec)"
+  (( t - _last_dedupe_sec < DEDUP_INTERVAL_SEC )) && return 0
+  _last_dedupe_sec="$t"
+
+  local src
+  for src in vm_game.monitor vm_chat.monitor vm_music.monitor; do
+    mapfile -t ids < <(pactl list short modules 2>/dev/null | awk -v s="$src" -v k="$target" '
+      $2=="module-loopback" && $0 ~ ("source=" s) && $0 ~ ("sink=" k) {print $1}
+    ')
+    if (( ${#ids[@]} > 1 )); then
+      local keep="${ids[0]}"
+      local id
+      for id in "${ids[@]:1}"; do
+        pactl unload-module "$id" >/dev/null 2>&1 || true
+      done
+      log "dedupe: kept $keep for $src -> $target (removed $(( ${#ids[@]} - 1 )))"
+    fi
+  done
+}
+
 main() {
+  load_conf
   log "starting (LATENCY_MSEC=$LATENCY_MSEC ASTRO_TARGET=${ASTRO_TARGET:-auto} ASTRO_MATCH_RE=$ASTRO_MATCH_RE)"
   while true; do
     wait_for_pactl
+    load_conf
 
     local target=""
     target="$(find_astro_target)"
@@ -125,10 +177,21 @@ main() {
       continue
     fi
 
-    # Ensure loopbacks exist. NO UNLOADS. No thrash.
+    local last=""
+    last="$(cat "$STATE_FILE" 2>/dev/null || true)"
+    if [[ -n "$last" && "$last" != "$target" ]]; then
+      log "target changed: $last -> $target; removing old loopbacks"
+      unload_vm_loopbacks_to_sink "$last"
+    fi
+    if [[ "$last" != "$target" ]]; then
+      printf '%s\n' "$target" > "$STATE_FILE"
+    fi
+
+    # Ensure loopbacks exist; unload only on target change.
     ensure_loopback "vm_game.monitor"  "$target"
     ensure_loopback "vm_chat.monitor"  "$target"
     ensure_loopback "vm_music.monitor" "$target"
+    dedupe_loopbacks_for_target "$target"
 
     sleep 2
   done

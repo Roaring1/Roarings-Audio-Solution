@@ -1,11 +1,12 @@
 [Unit]
-Description=Roaring VM sinks (vm_game/vm_chat/vm_music)
+Description=Roaring audio stack daemon (VM sinks + loopbacks to Astro)
 After=pipewire-pulse.service wireplumber.service
 Wants=pipewire-pulse.service wireplumber.service
+Conflicts=roaring-audio-routesd.service
 
 [Service]
 Type=simple
-ExecStart=%h/bin/roaring_vm_sinks.sh
+ExecStart=%h/bin/roaring_audio_stackd.sh
 Restart=always
 RestartSec=2
 
