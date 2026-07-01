@@ -1,0 +1,13 @@
+[Unit]
+Description=Patch Carla audio inputs (sm7b_mono -> Carla)
+After=roaring-carla-session.service pipewire.service wireplumber.service
+Wants=roaring-carla-session.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/roaring/bin/roaring_carla_patch.sh
+RemainAfterExit=no
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=default.target

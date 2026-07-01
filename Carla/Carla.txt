@@ -8,7 +8,7 @@ The scripts need to be edited, based on where you place the carxp file.
 In my service-- "roaring-carla-session.service":
 
 
-ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp"'
+ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "/home/roaring/Desktop/CarlaProject_Roaring.carxp"'
 
 
-.. Here, Carla's saved at "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp" .. edit the file to be what you want.
+.. Here, Carla's saved at "/home/roaring/Desktop/CarlaProject_Roaring.carxp" .. edit the file to be what you want.

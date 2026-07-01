@@ -8,7 +8,7 @@ StartLimitBurst=6
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/bash -lc 'until pactl info >/dev/null 2>&1; do sleep 0.2; done'
-ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "$HOME/.config/roaring/saved_1-9-26_CarlaMicSettings.carxp"'
+ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "/home/roaring/Desktop/CarlaProject_Roaring.carxp"'
 Restart=on-failure
 RestartSec=3
 TimeoutStartSec=60

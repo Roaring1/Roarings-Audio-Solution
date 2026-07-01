@@ -7,6 +7,7 @@ set -euo pipefail
 # - Strong pre_mute/post_mute to reduce scratches on HARD restarts.
 # - Captures which MPRIS players were Playing and resumes them after restart.
 # - Tries to restart Carla session via roaring-carla-session.service.
+# - Starts roaring-carla-patch.service after Carla to fix sm7b_mono->Carla links.
 # - Does NOT attempt pactl unload-module (PipeWire-Pulse often denies it).
 # - notify-send popups only contain end-user messages (no debug spam).
 
@@ -15,8 +16,12 @@ DISABLE_AUTOREFRESH="yes"
 RESUME_MEDIA="yes"
 TRY_CARLA="yes"
 DUMP_ON_RESTART="yes"
+PROMPT_CARLA="yes"
+RESUME_DISCORD="yes"
+CARLA_MODE_OVERRIDE=""
 SCARLETT_MIRROR_STATE="$HOME/.cache/roaring_scarlett_loopbacks"
 TOGGLE_SCARLETT="$HOME/bin/toggle_scarlett_speakers.sh"
+CARLA_MODE_FILE="$HOME/.config/roaring/carla_mode"
 
 # Best-effort: avoid low per-shell FD limits for pactl/journal usage.
 ulimit -n 1048576 2>/dev/null || true
@@ -29,6 +34,11 @@ for a in "${@:-}"; do
     --no-resume-media) RESUME_MEDIA="no" ;;
     --no-carla) TRY_CARLA="no" ;;
     --no-dump) DUMP_ON_RESTART="no" ;;
+    --no-prompt-carla) PROMPT_CARLA="no" ;;
+    --prompt-carla) PROMPT_CARLA="yes" ;;
+    --no-discord) RESUME_DISCORD="no" ;;
+    --patchbay) CARLA_MODE_OVERRIDE="patchbay" ;;
+    --no-patchbay) CARLA_MODE_OVERRIDE="rack" ;;
     *) ;;
   esac
 done
@@ -38,10 +48,10 @@ ROARING_UNITS=(
   "roaring-audio-autorefresh.service"
   "lpd8-mixer.service"
   "roaring-audio-routesd.service"
-  "roaring-audio-stackd.service"
   "roaring-mic-routesd.service"
   "roaring-vm-sinks.service"
   "roaring-mic-busses.service"
+  "roaring-moonlight-mic.service"
 )
 
 PIPEWIRE_UNITS=(
@@ -136,7 +146,13 @@ stop_everything() {
 
 carla_unit_exists() { systemctl --user cat "$CARLA_UNIT" >/dev/null 2>&1; }
 carla_unit_active() { systemctl --user is-active -q "$CARLA_UNIT"; }
-carla_proc_running() { pgrep -x carla >/dev/null 2>&1; }
+carla_proc_running() {
+  # Match only the real Carla python3 process, not the bwrap wrappers.
+  # bwrap processes also carry the .carxp path in their argv, causing false positives.
+  pgrep -f '/app/share/carla/carla' >/dev/null 2>&1 ||
+    pgrep -f '/usr/share/carla/carla' >/dev/null 2>&1 ||
+    pgrep -f 'carla-rack' >/dev/null 2>&1
+}
 
 log_carla_state() {
   local unit="no" active="no" proc="no"
@@ -147,15 +163,22 @@ log_carla_state() {
 }
 
 stop_carla_process() {
-  if pgrep -x carla >/dev/null 2>&1; then
+  if carla_proc_running; then
     log "carla stop: proc"
-    pkill -TERM -x carla >/dev/null 2>&1 || true
+    # Kill the real python3 Carla process first, then clean up bwrap wrappers.
+    # Killing bwrap first can orphan the python process or cause unclean shutdown.
+    pkill -TERM -f '/app/share/carla/carla'   >/dev/null 2>&1 || true
+    pkill -TERM -f '/usr/share/carla/carla'   >/dev/null 2>&1 || true
+    pkill -TERM -f 'carla-rack'               >/dev/null 2>&1 || true
+    pkill -TERM -f 'CarlaProject_Roaring\.carxp' >/dev/null 2>&1 || true
     local i=0
-    while pgrep -x carla >/dev/null 2>&1; do
+    while carla_proc_running; do
       ((i++)) || true
       if (( i > 20 )); then
         log "carla stop: sigkill"
-        pkill -KILL -x carla >/dev/null 2>&1 || true
+        pkill -KILL -f '/app/share/carla/carla'      >/dev/null 2>&1 || true
+        pkill -KILL -f 'CarlaProject_Roaring\.carxp' >/dev/null 2>&1 || true
+        pkill -KILL -f 'carla-rack'                  >/dev/null 2>&1 || true
         break
       fi
       msleep 200
@@ -202,13 +225,16 @@ start_roaring_stack() {
     "roaring-mic-busses.service" \
     "roaring-mic-routesd.service" \
     "roaring-audio-routesd.service" \
-    "lpd8-mixer.service" >/dev/null 2>&1 || true
+    "lpd8-mixer.service" \
+    "roaring-moonlight-mic.service" >/dev/null 2>&1 || true
 }
 
 # -------- media resume --------
 _PLAYING_PLAYERS=()
 _SPOTIFY_WAS_RUNNING="no"
 _SPOTIFY_CMD=""
+_DISCORD_WAS_RUNNING="no"
+_DISCORD_CMD=""
 
 pre_media() {
   [[ "$RESUME_MEDIA" == "yes" ]] || return 0
@@ -236,6 +262,45 @@ post_media() {
   done
 }
 # --------------------------------
+
+detect_discord_cmd() {
+  if command -v discord >/dev/null 2>&1; then
+    _DISCORD_CMD="discord"
+    return 0
+  fi
+  if command -v flatpak >/dev/null 2>&1 && flatpak info -q com.discordapp.Discord >/dev/null 2>&1; then
+    _DISCORD_CMD="flatpak run com.discordapp.Discord"
+    return 0
+  fi
+  _DISCORD_CMD=""
+}
+
+pre_discord() {
+  [[ "$RESUME_DISCORD" == "yes" ]] || return 0
+  _DISCORD_WAS_RUNNING="no"
+  detect_discord_cmd
+  if pgrep -x Discord >/dev/null 2>&1 || pgrep -x discord >/dev/null 2>&1 || pgrep -f com.discordapp.Discord >/dev/null 2>&1; then
+    _DISCORD_WAS_RUNNING="yes"
+  fi
+  if [[ "$_DISCORD_WAS_RUNNING" == "yes" ]]; then
+    log "Discord detected; will quick-restart after audio reset."
+  elif [[ -z "$_DISCORD_CMD" ]]; then
+    log "Discord not found; skipping app restart."
+  fi
+}
+
+post_discord() {
+  [[ "$RESUME_DISCORD" == "yes" ]] || return 0
+  [[ "$_DISCORD_WAS_RUNNING" == "yes" ]] || return 0
+  [[ -n "$_DISCORD_CMD" ]] || return 0
+
+  log "Restarting Discord..."
+  pkill -TERM -x Discord >/dev/null 2>&1 || true
+  pkill -TERM -x discord >/dev/null 2>&1 || true
+  pkill -TERM -f com.discordapp.Discord >/dev/null 2>&1 || true
+  msleep 500
+  nohup $_DISCORD_CMD >/dev/null 2>&1 &
+}
 
 detect_spotify_cmd() {
   if command -v spotify >/dev/null 2>&1; then
@@ -273,15 +338,50 @@ post_spotify() {
   nohup $_SPOTIFY_CMD >/dev/null 2>&1 &
 }
 
+prompt_carla_restart() {
+  [[ "$PROMPT_CARLA" == "yes" ]] || return 0
+  [[ -t 0 ]] || return 0
+
+  local ans=""
+  read -r -t 5 -p "Restart Carla? (y/n or 1/2) [auto-no in 5s]: " ans || ans=""
+  case "${ans,,}" in
+    y|yes|1) TRY_CARLA="yes" ;;
+    n|no|2|"") TRY_CARLA="no" ;;
+    *) TRY_CARLA="no" ;;
+  esac
+}
+
+apply_carla_mode_override() {
+  [[ -n "$CARLA_MODE_OVERRIDE" ]] || return 0
+  mkdir -p "$(dirname "$CARLA_MODE_FILE")"
+  printf '%s\n' "$CARLA_MODE_OVERRIDE" > "$CARLA_MODE_FILE"
+  log "carla mode: ${CARLA_MODE_OVERRIDE}"
+}
+
 restart_carla_best_effort() {
   [[ "$TRY_CARLA" == "yes" ]] || return 0
 
   log_carla_state
+
+  # Wait for the PipeWire audio graph to be usable before starting Carla.
+  # roaring-vm-sinks creates vm_game/vm_chat; Carla needs them to patch its
+  # plugins.  Starting too early (e.g. at 500ms after PW restart) leaves Carla
+  # with no sinks to connect to, causing plugins to disconnect permanently.
+  wait_for_pactl
+  local t=0
+  until sink_exists "vm_game" && sink_exists "vm_chat"; do
+    ((t++)) || true
+    if (( t > 50 )); then
+      log "carla start: vm_game/vm_chat not ready after 5s; starting anyway"
+      break
+    fi
+    msleep 100
+  done
+  log "carla start: sinks ready after ~$((t*100))ms"
+
   if carla_unit_exists; then
     notify "Restarting Carla session…"
     log "carla start: unit"
-    wait_for_pactl
-    msleep 500
     systemctl --user reset-failed "$CARLA_UNIT" >/dev/null 2>&1 || true
     if carla_unit_active; then
       systemctl --user restart "$CARLA_UNIT" >/dev/null 2>&1 || true
@@ -290,29 +390,37 @@ restart_carla_best_effort() {
     fi
     if carla_unit_active; then
       log_carla_state
+      systemctl --user reset-failed roaring-carla-patch.service >/dev/null 2>&1 || true
+      systemctl --user start roaring-carla-patch.service >/dev/null 2>&1 || true
+      log "carla-patch: started"
       return 0
     fi
-
     log "carla start: unit inactive; fallback"
   fi
 
   if command -v carla >/dev/null 2>&1; then
     notify "Restarting Carla…"
     log "carla start: direct"
-    wait_for_pactl
-    msleep 500
-    if ! pgrep -x carla >/dev/null 2>&1; then
+    if ! carla_proc_running; then
       local carxp=""
-      carxp="$(systemctl --user cat "$CARLA_UNIT" 2>/dev/null | grep -oE '(\\$HOME[^" ]+\\.carxp|/[A-Za-z0-9._/-]+\\.carxp)' | head -n 1 || true)"
+      carxp="$(systemctl --user cat "$CARLA_UNIT" 2>/dev/null | grep -oE '(\\$HOME[^" ]+\.carxp|/[A-Za-z0-9._/-]+\.carxp)' | head -n 1 || true)"
       if [[ "$carxp" == \$HOME* ]]; then
         carxp="${carxp/\$HOME/$HOME}"
       fi
       if [[ -n "$carxp" && -f "$carxp" ]]; then
         log "carla start: project=$(basename "$carxp")"
-        nohup carla "$carxp" >/dev/null 2>&1 &
+        if [[ -f "$CARLA_MODE_FILE" ]] && [[ "$(cat "$CARLA_MODE_FILE" 2>/dev/null || true)" == "patchbay" ]]; then
+          nohup carla "$carxp" >/dev/null 2>&1 &
+        else
+          nohup carla-rack "$carxp" >/dev/null 2>&1 &
+        fi
       else
         log "carla start: no project"
-        nohup carla >/dev/null 2>&1 &
+        if [[ -f "$CARLA_MODE_FILE" ]] && [[ "$(cat "$CARLA_MODE_FILE" 2>/dev/null || true)" == "patchbay" ]]; then
+          nohup carla >/dev/null 2>&1 &
+        else
+          nohup carla-rack >/dev/null 2>&1 &
+        fi
       fi
     fi
     log_carla_state
@@ -401,12 +509,15 @@ main() {
   systemctl --user reset-failed  >/dev/null 2>&1 || true
 
   load_conf
+  apply_carla_mode_override
   if [[ -s "$SCARLETT_MIRROR_STATE" ]]; then
     _SCARLETT_MIRROR_WAS_ON="yes"
     log "scarlett mirror: was on (state file present)"
   fi
   pre_media
+  pre_discord
   pre_spotify
+  prompt_carla_restart
   pre_mute
 
   stop_carla_if_requested
@@ -422,7 +533,18 @@ main() {
   start_roaring_stack
   msleep 350
 
+  # Force default audio source to b1_mic (Carla-processed mic) instead of b2_mic.
+  # WirePlumber may restore b2_mic from state if it was ever the last default.
+  local b1_id
+  b1_id="$(wpctl status 2>/dev/null | grep -E '\bb1_mic\b' | grep -oE '[0-9]+\.' | head -1 | tr -d '.' || true)"
+  if [[ -n "$b1_id" ]]; then
+    wpctl set-default "$b1_id" >/dev/null 2>&1 && log "default source: b1_mic (id=$b1_id)" || true
+  else
+    log "default source: b1_mic not found yet, skipping"
+  fi
+
   restart_carla_best_effort
+  post_discord
   post_spotify
 
   if [[ "$_SCARLETT_MIRROR_WAS_ON" == "yes" ]] && [[ -x "$TOGGLE_SCARLETT" ]]; then
