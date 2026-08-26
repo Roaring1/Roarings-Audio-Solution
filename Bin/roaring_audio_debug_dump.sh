@@ -24,10 +24,7 @@ ROARING_UNITS=(
   roaring-mic-busses.service
   roaring-mic-routesd.service
   roaring-audio-routesd.service
-  roaring-audio-stackd.service
   lpd8-mixer.service
-  roaring-audio-autorefresh.path
-  roaring-audio-autorefresh.service
   roaring-carla-session.service
 )
 
@@ -38,6 +35,8 @@ PIPEWIRE_UNITS=(
 )
 
 KEY_UNITS=( "${PIPEWIRE_UNITS[@]}" "${ROARING_UNITS[@]}" )
+  roaring-vesktop-mic-watchd.service
+  roaring-laptop-audio.service
 
 write_cmd() {
   local name="$1"; shift
@@ -116,6 +115,7 @@ cat > "$OUTDIR/index.txt" <<'EOF'
 all_errors.txt          - all user-level errors (journalctl -p err..alert)
 10_files_and_hashes.txt - bin listing + hashes of key scripts/config
 files/                  - copies of referenced scripts/configs
+roaring_audio_control.py.gz - compressed GUI app (gunzip to extract)
 EOF
 
 log "collecting systemd status..."
@@ -124,8 +124,6 @@ write_cmd "01_systemd_status.txt" bash -lc '
   systemctl --user --no-pager --full status \
     pipewire.service pipewire-pulse.service wireplumber.service \
     roaring-vm-sinks.service roaring-mic-busses.service roaring-mic-routesd.service \
-    roaring-audio-routesd.service roaring-audio-stackd.service lpd8-mixer.service \
-    roaring-audio-autorefresh.path roaring-audio-autorefresh.service \
     roaring-carla-session.service 2>&1 || true
   echo
   echo "## systemctl --user list-units (filtered)"
@@ -137,8 +135,6 @@ write_cmd "02_systemd_show.txt" bash -lc '
   for u in \
     pipewire.service pipewire-pulse.service wireplumber.service \
     roaring-vm-sinks.service roaring-mic-busses.service roaring-mic-routesd.service \
-    roaring-audio-routesd.service roaring-audio-stackd.service lpd8-mixer.service \
-    roaring-audio-autorefresh.path roaring-audio-autorefresh.service \
     roaring-carla-session.service; do
     echo "## $u"
     systemctl --user show "$u" \
@@ -195,8 +191,6 @@ fi
 log "collecting journals (last 30 minutes)..."
 write_cmd "07_journal_roaring.txt" journalctl --user --since "30 min ago" --no-pager \
   -u roaring-vm-sinks.service -u roaring-mic-busses.service -u roaring-mic-routesd.service \
-  -u roaring-audio-routesd.service -u roaring-audio-stackd.service -u lpd8-mixer.service \
-  -u roaring-audio-autorefresh.path -u roaring-audio-autorefresh.service \
   -u roaring-carla-session.service
 
 write_cmd "08_journal_pipewire.txt" journalctl --user --since "30 min ago" --no-pager \
@@ -226,6 +220,7 @@ write_cmd "10_files_and_hashes.txt" bash -lc '
     "$HOME/bin/lpd8_mixer.sh" \
     "$HOME/bin/roaring_restart_everything.sh" \
     "$HOME/bin/roaring_audio_debug_dump.sh" \
+    "$HOME/bin/roaring_audio_control.py" \
     "$HOME/.config/roaring_mixer.conf" \
   ; do
     [[ -f "$f" ]] || continue
@@ -241,17 +236,97 @@ write_file_if_exists "$HOME/bin/roaring_mic_routesd.sh"
 write_file_if_exists "$HOME/bin/lpd8_mixer.sh"
 write_file_if_exists "$HOME/bin/roaring_restart_everything.sh"
 write_file_if_exists "$HOME/bin/roaring_audio_debug_dump.sh"
+write_file_if_exists "$HOME/bin/roaring_audio_control.py"
 write_file_if_exists "$HOME/.config/roaring_mixer.conf"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-carla-session.service"
-write_file_if_exists "$HOME/.config/systemd/user/roaring-audio-autorefresh.path"
-write_file_if_exists "$HOME/.config/systemd/user/roaring-audio-autorefresh.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-audio-routesd.service"
-write_file_if_exists "$HOME/.config/systemd/user/roaring-audio-stackd.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-mic-busses.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-mic-routesd.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-vm-sinks.service"
 write_file_if_exists "$HOME/.config/systemd/user/lpd8-mixer.service"
+write_file_if_exists "$HOME/bin/roaring_carla_launch.sh"
+write_file_if_exists "$HOME/bin/start_roaring_and_carla.sh"
+write_file_if_exists "$HOME/bin/roaring_toggle_astro_target.sh"
+write_file_if_exists "$HOME/bin/toggle_scarlett_speakers.sh"
+write_file_if_exists "$HOME/.config/systemd/user/default-sink-vm-game.service"
+write_file_if_exists "$HOME/.config/roaring_mic_router.conf"
 
+# Include roaring_audio_control.py as a compressed copy for easy transport
+if [[ -f "$HOME/bin/roaring_audio_control.py" ]]; then
+  gzip -c "$HOME/bin/roaring_audio_control.py" > "$OUTDIR/roaring_audio_control.py.gz"
+  log "included roaring_audio_control.py.gz"
+fi
+
+# Include the most-recent live VU peak CSV dump (written by PeakPoller while
+# roaring_audio_control.py is running).  The file is a gzip-compressed CSV at
+# ~/roaring_vu_dump_<unix_epoch>.csv.gz — grab the newest one if present.
+VU_DUMP="$(ls -t "$HOME"/roaring_vu_dump_*.csv.gz 2>/dev/null | head -1 || true)"
+if [[ -n "$VU_DUMP" && -f "$VU_DUMP" ]]; then
+  cp "$VU_DUMP" "$OUTDIR/vu_peak_dump.csv.gz"
+  log "included VU peak dump: $(basename "$VU_DUMP") -> vu_peak_dump.csv.gz"
+else
+  log "no VU peak dump found at ~/roaring_vu_dump_*.csv.gz (app not running or bug hit?)"
+fi
+
+
+# ── Windows laptop state (via SSH) ──────────────────────────────────────────
+WIN_IP="${WIN_IP:-192.168.50.132}"
+WIN_USER="${WIN_USER:-roari}"
+WIN_KEY="$HOME/.ssh/roaring_win"
+WIN_OUT="$OUTDIR/09_windows_state.txt"
+
+log "collecting Windows state via SSH..."
+if ssh -i "$WIN_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$WIN_USER@$WIN_IP" hostname >/dev/null 2>&1; then
+  {
+    echo "### Windows state collected at $(date --iso-8601=seconds)"
+    echo "### target: $WIN_USER@$WIN_IP"
+    echo ""
+
+    echo "--- hostname / uptime ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"hostname; (Get-Date); (Get-CimInstance Win32_OperatingSystem).LastBootUpTime\""
+
+    echo ""
+    echo "--- RoaringMic process ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"Get-Process powershell -EA SilentlyContinue | Select Id, CPU, StartTime | Sort StartTime | Format-Table -Auto\""
+
+    echo ""
+    echo "--- Port 46001 (WaveRouter receiver) ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"netstat -an | Select-String '46001'\""
+
+    echo ""
+    echo "--- waveOut / audio devices ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"Get-CimInstance Win32_SoundDevice | Select Name, Status | Format-Table -Auto\""
+
+    echo ""
+    echo "--- CABLE device ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"Get-CimInstance Win32_SoundDevice | Select Name, Status | Format-Table -Auto\""
+
+    echo ""
+    echo "--- Sunshine process ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"Get-Process sunshine -EA SilentlyContinue | Select Id, CPU, StartTime\""
+
+    echo ""
+    echo "--- RoaringMic AppDir ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"dir C:\Users\roari\AppData\Local\RoaringMic | Select Name, LastWriteTime, Length | Format-Table -Auto\""
+
+    echo ""
+    echo "--- Firewall SSH rule ---"
+    ssh -i "$WIN_KEY" -o BatchMode=yes "$WIN_USER@$WIN_IP" \
+      "powershell -NoProfile -NonInteractive -Command \"Get-NetFirewallRule -DisplayName '*SSH*' | Select DisplayName, Enabled, Direction, Action | Format-Table -Auto\""
+
+  } > "$WIN_OUT" 2>&1 || true || true
+  echo "[debug-dump] Windows state collected -> $(basename "$WIN_OUT")"
+else
+  echo "### Windows SSH unreachable at $WIN_IP -- skipped" > "$WIN_OUT"
+  echo "[debug-dump] WARNING: could not reach Windows laptop -- skipped"
+fi
 log "packing $TAR ..."
 tar -czf "$TAR" -C "$(dirname "$OUTDIR")" "$(basename "$OUTDIR")"
 

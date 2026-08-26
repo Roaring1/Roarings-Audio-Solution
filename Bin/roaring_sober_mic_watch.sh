@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Watch for Sober capture streams and route them to b1_mic via PipeWire metadata.
-# Runs as a persistent service; polls every 2 seconds.
+# Runs as a persistent service.
+#
+# Gap #7: the original loop ran `sleep 2` at the TOP of every iteration, so
+# there was always up to a 2s window in which Sober recorded to the wrong
+# source (b2_mic) before routing kicked in. Now:
+#   * the first check runs IMMEDIATELY (0s latency when Sober is already up),
+#   * the poll interval is configurable via SOBER_WATCH_POLL (default 0.5s),
+# cutting worst-case latency from 2s to 0.5s without the fragility of a
+# long-lived `pw-metadata --monitor` subprocess that would be far harder to
+# supervise and restart cleanly under systemd.
 
 set -euo pipefail
+
+POLL="${SOBER_WATCH_POLL:-0.5}"
 
 log() { echo "[sober-mic-watch] $(date +'%H:%M:%S') $*"; }
 
@@ -41,26 +52,40 @@ get_metadata_target() {
         || true
 }
 
-log "started"
-
-last_sober_id=""
-
-while true; do
-    sleep 2
-
+route_once() {
+    local b1_serial sober_id current
     b1_serial="$(get_b1_serial)"
-    [[ -z "$b1_serial" ]] && continue
+    if [[ -z "$b1_serial" ]]; then return 0; fi
 
     sober_id="$(get_sober_capture_id)"
-    [[ -z "$sober_id" ]] && { last_sober_id=""; continue; }
+    if [[ -z "$sober_id" ]]; then return 0; fi
 
-    # Check current metadata target for this Sober node
     current="$(get_metadata_target "$sober_id")"
+    if [[ "$current" == "$b1_serial" ]]; then return 0; fi
 
-    if [[ "$current" != "$b1_serial" ]]; then
-        log "routing Sober (node $sober_id) -> b1_mic (serial $b1_serial)"
-        pw-metadata -n default "$sober_id" target.object "$b1_serial" \
-            >/dev/null 2>&1 && log "done" || log "pw-metadata failed"
-        last_sober_id="$sober_id"
+    log "routing Sober (node $sober_id) -> b1_mic (serial $b1_serial)"
+    # if/then/else, not A && B || C: `log done` could itself fail under
+    # `set -e` and wrongly trigger the failure branch (SC2015).
+    if pw-metadata -n default "$sober_id" target.object "$b1_serial" \
+            >/dev/null 2>&1; then
+        log "done"
+    else
+        log "pw-metadata failed"
     fi
-done
+}
+
+main() {
+    log "started (poll ${POLL}s)"
+    local first=1
+    while true; do
+        # Check immediately on the first pass (no startup latency); sleep only
+        # between subsequent passes.
+        if [[ "$first" == "1" ]]; then first=0; else sleep "$POLL"; fi
+        route_once
+    done
+}
+
+# Only auto-run when executed directly; allows sourcing functions in tests.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi

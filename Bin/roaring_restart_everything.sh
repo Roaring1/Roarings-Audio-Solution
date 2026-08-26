@@ -299,6 +299,9 @@ post_discord() {
   pkill -TERM -x discord >/dev/null 2>&1 || true
   pkill -TERM -f com.discordapp.Discord >/dev/null 2>&1 || true
   msleep 500
+  # intentional word-split of an internal command literal ("flatpak run ..."),
+  # not user input; array would be cleaner but this is controlled (SC2086).
+  # shellcheck disable=SC2086
   nohup $_DISCORD_CMD >/dev/null 2>&1 &
 }
 
@@ -335,6 +338,9 @@ post_spotify() {
   pkill -TERM -x spotify >/dev/null 2>&1 || true
   pkill -TERM -f com.spotify.Client >/dev/null 2>&1 || true
   msleep 500
+  # intentional word-split of an internal command literal ("flatpak run ..."),
+  # not user input; array would be cleaner but this is controlled (SC2086).
+  # shellcheck disable=SC2086
   nohup $_SPOTIFY_CMD >/dev/null 2>&1 &
 }
 
@@ -403,6 +409,9 @@ restart_carla_best_effort() {
     log "carla start: direct"
     if ! carla_proc_running; then
       local carxp=""
+      # the single-quoted string is a grep -oE regex that matches the literal
+      # text "$HOME"; it must NOT be expanded by the shell (SC2016 is expected).
+      # shellcheck disable=SC2016
       carxp="$(systemctl --user cat "$CARLA_UNIT" 2>/dev/null | grep -oE '(\\$HOME[^" ]+\.carxp|/[A-Za-z0-9._/-]+\.carxp)' | head -n 1 || true)"
       if [[ "$carxp" == \$HOME* ]]; then
         carxp="${carxp/\$HOME/$HOME}"
