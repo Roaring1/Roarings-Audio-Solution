@@ -122,8 +122,16 @@ Assert-True ($source.Contains('StableArrivalCount >= 6000')) 'adaptive buffer re
 Assert-True ($source.Contains('Stopwatch.Frequency * 600L')) 'learned safe floor only decreases after ten wall-clock minutes of stability'
 Assert-True ($source.Contains('MinAutoPreBuf = PreBuf')) 'actual WaveOut underrun raises the learned connection floor'
 Assert-True ($source.Contains('Save-ReceiverConfig')) 'learned connection profile is persisted outside the audio receive loop'
+$pollStart = $source.IndexOf('$Poll.add_Tick({')
+$pollEnd = $source.IndexOf('$Poll.Start()', $pollStart)
+$pollBody = if ($pollStart -ge 0 -and $pollEnd -gt $pollStart) { $source.Substring($pollStart, $pollEnd - $pollStart) } else { '' }
+Assert-True ($pollBody.Contains('Save-LearnedSafeBufferProfile')) 'learned profile is checked from the always-on timer, not only the visible flyout'
+Assert-True ($source.Contains('no-recent-packets')) 'receiver health diagnostics distinguish missing packets from profile-save failure'
+Assert-True ($source.Contains('profile-saved')) 'receiver records successful learned-profile persistence'
 $saveProfileMatch = [regex]::Match($source, '(?ms)^function Save-LearnedSafeBufferProfile \{.*?^\}')
 Assert-True $saveProfileMatch.Success 'learned profile save helper can be isolated for testing'
+$script:SafeProfileDiagAt = [datetime]::MinValue
+function Write-ReceiverHealthDiagnostic([string]$Message) {}
 Invoke-Expression $saveProfileMatch.Value
 $Cfg = [PSCustomObject]@{ SafePreBufPkts = 1; SafePreBufPeerIP = ''; SafePreBufRate = 48000; SafePreBufPacketBytes = 0; PcHost = '192.168.50.123'; Rate = 48000 }
 $script:SafeProfileSaveRetryAt = [datetime]::MinValue
