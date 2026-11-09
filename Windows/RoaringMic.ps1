@@ -26,7 +26,7 @@ $AppDir  = "$env:LOCALAPPDATA\RoaringMic"
 $CfgPath = "$AppDir\config.json"
 $null    = New-Item $AppDir -ItemType Directory -Force -EA SilentlyContinue
 
-$Cfg = [PSCustomObject]@{ Port = 46001; Rate = 48000; PcHost = '192.168.50.123'; PreBufMode = 'auto'; PreBufPkts = 5; SafePreBufPkts = 1; SafePreBufPeerIP = ''; SafePreBufRate = 48000; SafePreBufPacketBytes = 0; Volume = 100 }
+$Cfg = [PSCustomObject]@{ Port = 46001; Rate = 48000; PcHost = '192.168.50.123'; PreBufMode = 'auto'; PreBufPkts = 5; SafePreBufPkts = 2; SafePreBufPeerIP = ''; SafePreBufRate = 48000; SafePreBufPacketBytes = 0; Volume = 100 }
 if (Test-Path $CfgPath) {
     try {
         $j = Get-Content $CfgPath -Raw | ConvertFrom-Json
@@ -39,8 +39,8 @@ try { $Cfg.Port = [Math]::Max(1,[Math]::Min(65535,[int]$Cfg.Port)) }
 catch { $Cfg.Port = 46001 }
 try { $Cfg.PreBufPkts = [Math]::Max(1,[Math]::Min(8,[int]$Cfg.PreBufPkts)) }
 catch { $Cfg.PreBufPkts = 5 }
-try { $Cfg.SafePreBufPkts = [Math]::Max(1,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) }
-catch { $Cfg.SafePreBufPkts = 1 }
+try { $Cfg.SafePreBufPkts = [Math]::Max(2,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) }
+catch { $Cfg.SafePreBufPkts = 2 }
 try { $Cfg.SafePreBufRate = [Math]::Max(8000,[Math]::Min(192000,[int]$Cfg.SafePreBufRate)) }
 catch { $Cfg.SafePreBufRate = 48000 }
 try { $Cfg.SafePreBufPacketBytes = [Math]::Max(0,[Math]::Min(8192,[int]$Cfg.SafePreBufPacketBytes)) }
@@ -126,11 +126,12 @@ public static class WaveRouter {
     // Start at one graph-aligned packet, then learn a per-peer safe floor from
     // actual WaveOut underruns. Persisted floors are scoped to peer, rate, and
     // packet size so a changed route/profile gets a fresh low-latency trial.
-    public static volatile int MinAutoPreBuf = 1;
+    public static volatile int MinAutoPreBuf = 2;
     public const int MaxAutoPreBuf = 8;
     public static volatile int ExpectedPacketBytes = 0;
     public static volatile int LastPacketBytes = 0;
     private static long StableFloorSinceTicks = 0;
+    private static long LastFloorRaiseTicks = 0;
     private static bool PacketProfileChecked = false;
 
     public static bool IsSafePreBufPeerRateMatch(string savedPeer, string currentPeer,
@@ -157,7 +158,15 @@ public static class WaveRouter {
         if (intervalMs <= 0.0 || packetMs <= 0.0) return current;
         if (!IsPacketArrivalLate(intervalMs, packetMs)) return current;
         int needed = (int)Math.Ceiling(intervalMs / packetMs);
-        return Math.Min(max, Math.Max(current + 1, Math.Max(min, needed)));
+        // Grow only to the number of packet durations actually needed. A
+        // slightly late packet must not add a redundant full packet of delay.
+        return Math.Min(max, Math.Max(current, Math.Max(min, needed)));
+    }
+
+    public static int CalculateNextSafePreBuf(int currentFloor, int max) {
+        if (max < 1) max = 1;
+        currentFloor = Math.Max(1, Math.Min(max, currentFloor));
+        return Math.Min(max, currentFloor + 1);
     }
 
     private static void ObservePacketArrival(int packetBytes) {
@@ -168,12 +177,13 @@ public static class WaveRouter {
             PacketProfileChecked = true;
             if (ExpectedPacketBytes > 0 && !IsSafePreBufPacketSizeMatch(ExpectedPacketBytes, packetBytes)) {
                 // A new graph quantum or packet profile invalidates the old
-                // connection floor. Re-learn from one packet, never inherit a
-                // buffer depth measured for a different packet duration.
-                MinAutoPreBuf = 1;
-                PreBuf = 1;
+                // connection floor. Re-learn from the conservative two-packet
+                // baseline, never inherit a depth measured for another profile.
+                MinAutoPreBuf = 2;
+                PreBuf = 2;
                 StableArrivalCount = 0;
                 StableFloorSinceTicks = 0;
+                LastFloorRaiseTicks = 0;
             }
         }
         long previous = Interlocked.Exchange(ref LastArrivalStopwatchTicks, now);
@@ -232,7 +242,7 @@ public static class WaveRouter {
         PacketProfileChecked = false;
         Interlocked.Exchange(ref ClippedSamples, 0);
         Interlocked.Exchange(ref LastArrivalStopwatchTicks, 0);
-        LastPacketDurationMs = 0.0; StableArrivalCount = 0; StableFloorSinceTicks = 0;
+        LastPacketDurationMs = 0.0; StableArrivalCount = 0; StableFloorSinceTicks = 0; LastFloorRaiseTicks = 0;
         PreBuf = AdaptiveBuffering
             ? MinAutoPreBuf
             : Math.Max(1, Math.Min(MaxAutoPreBuf, ConfiguredPreBuf));
@@ -357,11 +367,19 @@ public static class WaveRouter {
                     Primed = false;
                     Underruns++;
                     // ObservePacketArrival already made the single bounded
-                    // prebuffer increase for this late packet. Record that
-                    // depth as the learned safe floor for this peer/profile.
-                    if (AdaptiveBuffering && PreBuf > MinAutoPreBuf) {
-                        MinAutoPreBuf = PreBuf;
-                        StableFloorSinceTicks = 0;
+                    // prebuffer increase for this late packet. Raise the
+                    // persistent floor by one step per actual underrun; a single
+                    // transient gap must not pin the connection at the queue cap.
+                    if (AdaptiveBuffering) {
+                        long now = Stopwatch.GetTimestamp();
+                        int nextFloor = CalculateNextSafePreBuf(MinAutoPreBuf, MaxAutoPreBuf);
+                        if (nextFloor > MinAutoPreBuf &&
+                            (LastFloorRaiseTicks == 0 || now - LastFloorRaiseTicks >= Stopwatch.Frequency * 5L)) {
+                            MinAutoPreBuf = nextFloor;
+                            if (PreBuf < MinAutoPreBuf) PreBuf = MinAutoPreBuf;
+                            LastFloorRaiseTicks = now;
+                            StableFloorSinceTicks = 0;
+                        }
                     }
                 }
                 if (!Primed) {
@@ -455,9 +473,10 @@ function Start-Recv {
         [WaveRouter]::ConfiguredPreBuf = [int]$Cfg.PreBufPkts
         [WaveRouter]::AllowedSourceIP = [string]$Cfg.PcHost
         $profileMatches = [WaveRouter]::IsSafePreBufPeerRateMatch([string]$Cfg.SafePreBufPeerIP, [string]$Cfg.PcHost, [int]$Cfg.SafePreBufRate, [int]$Cfg.Rate)
-        [WaveRouter]::MinAutoPreBuf = if ($profileMatches) { [Math]::Max(1,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) } else { 1 }
+        [WaveRouter]::MinAutoPreBuf = if ($profileMatches) { [Math]::Max(2,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) } else { 2 }
         [WaveRouter]::ExpectedPacketBytes = if ($profileMatches) { [int]$Cfg.SafePreBufPacketBytes } else { 0 }
         [WaveRouter]::ResetCounters()
+        Write-ReceiverHealthDiagnostic "profile-loaded peer=$($Cfg.PcHost) rate=$($Cfg.Rate) expectedPacketBytes=$([WaveRouter]::ExpectedPacketBytes) safeFloor=$([WaveRouter]::MinAutoPreBuf) matched=$profileMatches"
         # Arm before dispatch so an immediate Stop cannot be overwritten by
         # Run() starting later on the worker thread.
         [WaveRouter]::Running = $true
@@ -707,7 +726,7 @@ function Save-LearnedSafeBufferProfile {
     $Cfg.SafePreBufPacketBytes = $packetBytes
     if (Save-ReceiverConfig) {
         $script:SafeProfileSaveRetryAt = [datetime]::MinValue
-        Write-ReceiverHealthDiagnostic "profile-saved peer=$($Cfg.SafePreBufPeerIP) rate=$($Cfg.SafePreBufRate) packetBytes=$($Cfg.SafePreBufPacketBytes) safeFloor=$($Cfg.SafePreBufPkts)"
+        Write-ReceiverHealthDiagnostic "profile-saved peer=$($Cfg.SafePreBufPeerIP) rate=$($Cfg.SafePreBufRate) packetBytes=$($Cfg.SafePreBufPacketBytes) safeFloor=$($Cfg.SafePreBufPkts) currentBuffer=$([WaveRouter]::PreBuf) underruns=$([WaveRouter]::Underruns) jitterMs=$([WaveRouter]::ArrivalJitterMs)"
     } else {
         Write-ReceiverHealthDiagnostic "profile-save-failed peer=$($Cfg.SafePreBufPeerIP) packetBytes=$($Cfg.SafePreBufPacketBytes)"
         # Restore the in-memory snapshot so the next timer tick retries rather
