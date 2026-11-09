@@ -7,11 +7,33 @@ StartLimitBurst=6
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/bash -lc 'until pactl info >/dev/null 2>&1; do sleep 0.2; done'
-ExecStart=/usr/bin/bash -lc 'exec pw-jack carla "/home/roaring/Desktop/CarlaProject_Roaring.carxp"'
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=QT_QPA_PLATFORM=wayland
+Environment=DISPLAY=:0
+Environment=PIPEWIRE_LATENCY=512/48000
+Environment=ROARING_CARLA_QUANTUM=512
+# Step 1: wait for PipeWire/Pulse with exponential backoff (0.5->4s, max 60s)
+# Step 1b: wait for the Wayland display socket to exist (fixes boot-time
+# segfault: Carla/JUCE crashes hard if launched before the compositor's
+# socket is up, falling back to a nonexistent X11 socket instead).
+# Step 1c: wait for the specific virtual sinks this project's patchbay
+# depends on (mic_b1/mic_b2/vm_game/vm_chat/vm_music, created asynchronously
+# by roaring-mic-bussesd.sh and roaring_vm_sinks.sh) to actually exist.
+# FIX: boot-time crash loop -- Carla was launching before these sinks were
+# created, causing a hard abort while auto-connecting/instantiating the LV2
+# chain against nonexistent ports. Generic pactl/Wayland readiness above is
+# not sufficient; we need the actual named sinks present.
+# Step 2: clear a stale Carla Python backend using an exact argv-prefix
+# check. The helper excludes itself and its ancestor processes; it does not
+# use broad command-line substring matching, which can hit this service.
+ExecStartPre=%h/bin/roaring_carla_wait_ready.sh
+ExecStartPre=%h/bin/roaring_carla_stop_stale.sh
+ExecStart=/usr/bin/bash -lc 'exec "$HOME/bin/roaring_carla_launch.sh" "/home/roaring/Desktop/CarlaProject_Roaring.carxp"'
+ExecStartPost=%h/bin/roaring_carla_set_quantum.sh
 Restart=on-failure
 RestartSec=3
-TimeoutStartSec=60
+TimeoutStartSec=180
 LimitNOFILE=1048576
 
 [Install]

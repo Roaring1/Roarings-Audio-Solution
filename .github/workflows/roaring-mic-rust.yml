@@ -1,0 +1,71 @@
+name: RoaringMic Rust engine
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.github/workflows/roaring-mic-rust.yml'
+      - 'docs/audio-performance.md'
+  push:
+    branches: [main, 'feature/**', 'perf/**']
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.github/workflows/roaring-mic-rust.yml'
+      - 'docs/audio-performance.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-core-and-cross-check:
+    name: Linux core tests and Windows target type-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.96.0 x86_64-pc-windows-gnu
+          rustup default 1.96.0
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Core and host tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Type-check the Windows WASAPI implementation
+        run: cargo check --workspace --target x86_64-pc-windows-gnu --locked
+
+  windows-build-and-validation:
+    name: Windows MSVC build and receiver validation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.96.0
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Shared core tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Existing Windows receiver regression suite
+        shell: powershell
+        run: .\Windows\Tests\Validate-RoaringMic.ps1
+      - name: Build native Windows receiver candidate
+        run: cargo build -p roaring-mic-windows --release --locked
+      - name: Upload uninstalled candidate binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: roaring-mic-windows-${{ github.sha }}
+          path: target/release/roaring-mic-windows.exe
+          if-no-files-found: error
+          retention-days: 14

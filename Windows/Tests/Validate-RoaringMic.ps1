@@ -98,6 +98,101 @@ $at200 = @(
 Assert-True (($at200 -join ',') -eq '-32768,-32768,0,32767,32767') '200 percent gain saturation'
 Assert-True ([WaveRouter]::GetClippedSamples() -eq 3) '200 percent clipping counter'
 
+# Adaptive packet buffering stays at the low floor under normal timing, grows
+# quickly when a datagram is late, and never exceeds the bounded device queue.
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 10.5, 10.0, 2, 8) -eq 2) 'adaptive buffer preserves the safe two-packet floor for normal timing'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 16.0, 10.0, 2, 8) -eq 2) 'late packet does not add an unnecessary third packet'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 25.0, 10.0, 2, 8) -eq 3) 'adaptive buffer grows to the mathematically required depth'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 100.0, 10.0, 2, 8) -eq 8) 'adaptive buffer clamps severe delay to queue cap'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 0.0, 10.0, 2, 8) -eq 2) 'adaptive buffer enforces configured safe floor'
+Assert-True ([WaveRouter]::CalculateNextSafePreBuf(2, 8) -eq 3) 'actual underrun raises persistent floor by one step, not to transient queue depth'
+Assert-True ([WaveRouter]::CalculateNextSafePreBuf(7, 8) -eq 8) 'learned safe floor remains capped at queue maximum'
+Assert-True ([WaveRouter]::ClampSafePreBuf(1) -eq 1) 'explicitly learned one-packet profile is accepted'
+Assert-True ([WaveRouter]::ClampSafePreBuf(0) -eq 1) 'learned floor is clamped to one packet minimum'
+Assert-True ([WaveRouter]::ClampSafePreBuf(99) -eq 8) 'learned floor is clamped to the bounded queue maximum'
+$mmcssHandle = [WaveRouter]::EnterAudioScheduling()
+Assert-True (@('Pro Audio','Audio','AboveNormal fallback','Normal fallback') -contains [WaveRouter]::MmcssMode) 'receiver worker registers with MMCSS or a safe thread-priority fallback'
+Write-Output "MMCSS_TEST_MODE=$([WaveRouter]::MmcssMode)"
+[WaveRouter]::ReleaseAudioScheduling($mmcssHandle)
+Assert-True ([WaveRouter]::MmcssMode -eq 'stopped') 'receiver worker releases MMCSS registration on exit'
+Assert-True ([WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.123',48000,48000)) 'learned queue profile is scoped to matching peer and rate'
+Assert-True (-not [WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.124',48000,48000)) 'learned queue profile is rejected for a different peer'
+Assert-True (-not [WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.123',48000,44100)) 'learned queue profile is rejected for a different sample rate'
+Assert-True ([WaveRouter]::IsSafePreBufPacketSizeMatch(1024,1024)) 'learned queue profile accepts matching packet size'
+Assert-True (-not [WaveRouter]::IsSafePreBufPacketSizeMatch(960,1024)) 'learned queue profile resets after graph packet-size change'
+Assert-True (-not [WaveRouter]::IsPacketArrivalLate(5.3, 5.0)) 'normal packet-boundary completion is not classified as late'
+Assert-True (-not [WaveRouter]::IsPacketArrivalLate(6.9, 5.0)) 'small scheduling variation is tolerated'
+Assert-True ([WaveRouter]::IsPacketArrivalLate(7.1, 5.0)) 'late packet gap is detected'
+Assert-True ($source.Contains('inFlight == 0 && LastArrivalWasLate')) 'natural WaveOut packet completion does not count as underrun'
+$underrunStart = $source.IndexOf('if (Primed && inFlight == 0 && LastArrivalWasLate) {')
+$underrunEnd = $source.IndexOf('if (!Primed)', $underrunStart)
+$underrunBlock = if ($underrunStart -ge 0 -and $underrunEnd -gt $underrunStart) { $source.Substring($underrunStart, $underrunEnd - $underrunStart) } else { '' }
+Assert-True ($underrunBlock.Length -gt 0 -and -not $underrunBlock.Contains('PreBuf++')) 'one late packet cannot double-increase the adaptive prebuffer'
+Assert-True ($source.Contains('StableArrivalCount >= 6000')) 'adaptive buffer reduction requires sustained stability'
+Assert-True ($source.Contains('Stopwatch.Frequency * 600L')) 'learned safe floor only decreases after ten wall-clock minutes of stability'
+Assert-True ($source.Contains('AvSetMmThreadCharacteristics')) 'receiver uses Windows MMCSS scheduling for the audio worker'
+Assert-True ($source.Contains('ClampSafePreBuf([int]$Cfg.SafePreBufPkts)')) 'a one-packet floor is used only when a matching learned profile exists'
+Assert-True ($source.Contains('MinAutoPreBuf = nextFloor')) 'actual WaveOut underrun raises the learned connection floor gradually'
+Assert-True ($source.Contains('Stopwatch.Frequency * 5L')) 'persistent safe-floor increases are rate-limited during a burst of underruns'
+Assert-True ($source.Contains('Save-ReceiverConfig')) 'learned connection profile is persisted outside the audio receive loop'
+$pollStart = $source.IndexOf('$Poll.add_Tick({')
+$pollEnd = $source.IndexOf('$Poll.Start()', $pollStart)
+$pollBody = if ($pollStart -ge 0 -and $pollEnd -gt $pollStart) { $source.Substring($pollStart, $pollEnd - $pollStart) } else { '' }
+Assert-True ($pollBody.Contains('Save-LearnedSafeBufferProfile')) 'learned profile is checked from the always-on timer, not only the visible flyout'
+Assert-True ($source.Contains('no-recent-packets')) 'receiver health diagnostics distinguish missing packets from profile-save failure'
+Assert-True ($source.Contains('profile-saved')) 'receiver records successful learned-profile persistence'
+Assert-True ($source.Contains('receiver-active device=') -and $source.Contains('mmcss=$([WaveRouter]::MmcssMode)')) 'receiver records the selected device and active audio scheduling class once per session'
+Assert-True ($source.Contains('receiver-health device=')) 'receiver emits low-frequency queue-depth and underrun health snapshots'
+Assert-True ($source.Contains('InFlight = inFlight')) 'receiver exposes actual WaveOut in-flight buffer count for diagnostics'
+Assert-True ($source.Contains('LastBufferCompletionMs')) 'receiver measures actual WaveOut buffer completion time'
+Assert-True ($source.Contains('LastArrivalIntervalMs')) 'receiver measures UDP packet arrival interval'
+Assert-True ($source.Contains('ActiveDeviceName = c.szPname')) 'receiver identifies the selected WaveOut output device'
+$saveProfileMatch = [regex]::Match($source, '(?ms)^function Save-LearnedSafeBufferProfile \{.*?^\}')
+Assert-True $saveProfileMatch.Success 'learned profile save helper can be isolated for testing'
+$script:SafeProfileDiagAt = [datetime]::MinValue
+function Write-ReceiverHealthDiagnostic([string]$Message) {}
+Invoke-Expression $saveProfileMatch.Value
+$Cfg = [PSCustomObject]@{ SafePreBufPkts = 2; SafePreBufPeerIP = ''; SafePreBufRate = 48000; SafePreBufPacketBytes = 0; PcHost = '192.168.50.123'; Rate = 48000 }
+$script:SafeProfileSaveRetryAt = [datetime]::MinValue
+$script:ProfileWriteCount = 0
+function Save-ReceiverConfig { $script:ProfileWriteCount++; return $true }
+[WaveRouter]::AdaptiveBuffering = $true
+[WaveRouter]::MinAutoPreBuf = 2
+[WaveRouter]::LastPacketBytes = 1024
+[WaveRouter]::LastPacketTicks = [datetime]::UtcNow.Ticks
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 1 -and $Cfg.SafePreBufPeerIP -eq '192.168.50.123' -and $Cfg.SafePreBufPacketBytes -eq 1024 -and $Cfg.SafePreBufPkts -eq 2) 'learned profile saves peer, rate, packet size and safe floor'
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 1) 'unchanged learned profile is not rewritten each timer tick'
+function Save-ReceiverConfig { $script:ProfileWriteCount++; return $false }
+[WaveRouter]::MinAutoPreBuf = 3
+[WaveRouter]::LastPacketBytes = 2048
+[WaveRouter]::LastPacketTicks = [datetime]::UtcNow.Ticks
+Save-LearnedSafeBufferProfile
+Assert-True ($Cfg.SafePreBufPkts -eq 2 -and $Cfg.SafePreBufPacketBytes -eq 1024 -and $script:ProfileWriteCount -eq 2) 'failed profile write restores the in-memory snapshot'
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 2) 'failed profile write uses a retry delay instead of repeated writes'
+Assert-True ($source.Contains('function Save-LearnedSafeBufferProfile')) 'learned profile persistence has a dedicated helper'
+$pollStart = $source.IndexOf('$Poll.add_Tick')
+$profileSaveCall = $source.IndexOf('Save-LearnedSafeBufferProfile', $pollStart)
+$refreshCall = $source.IndexOf('Refresh-Flyout', $pollStart)
+Assert-True ($pollStart -ge 0 -and $profileSaveCall -gt $pollStart -and $refreshCall -gt $profileSaveCall) 'learned profile persists from the always-running timer before optional flyout refresh'
+Assert-True ($source.Contains('SafeProfileSaveRetryAt')) 'failed profile writes are retried without balloon-notification spam'
+
+[WaveRouter]::AdaptiveBuffering = $true
+[WaveRouter]::ConfiguredPreBuf = 5
+[WaveRouter]::MinAutoPreBuf = 2
+[WaveRouter]::ResetCounters()
+Assert-True ([WaveRouter]::PreBuf -eq 2) 'automatic mode starts at the learned two-packet safe floor'
+[WaveRouter]::AdaptiveBuffering = $false
+[WaveRouter]::ConfiguredPreBuf = 5
+[WaveRouter]::ResetCounters()
+Assert-True ([WaveRouter]::PreBuf -eq 5) 'manual mode honors configured prebuffer'
+[WaveRouter]::AdaptiveBuffering = $true
+Assert-True ($source -match 'const int NBUF = MaxAutoPreBuf;') 'WaveOut queue depth is bounded to adaptive maximum'
+Assert-True ($source.Contains('udp.Client.ReceiveBufferSize = 8192;')) 'UDP receive buffer is bounded for low latency'
+Assert-True ($source.Contains('[Math]::Min(8,[int]$Cfg.PreBufPkts)')) 'manual prebuffer config is clamped to bounded maximum'
+
 [WaveRouter]::ResetCounters()
 [WaveRouter]::AllowedSourceIP = '192.168.50.123'
 Assert-True ([WaveRouter]::IsAcceptedPacket([byte[]]@(0,1), '192.168.50.123')) 'valid configured-source packet'
