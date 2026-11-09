@@ -673,16 +673,19 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
         {
             break Ok(());
         }
-        if event_handle.wait_for_event(EVENT_TIMEOUT_MS).is_err() {
-            metrics.event_timeouts.fetch_add(1, Ordering::Relaxed);
-            consecutive_timeouts += 1;
-            max_consecutive_timeouts = max_consecutive_timeouts.max(consecutive_timeouts);
-            if consecutive_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
-                break Err("WASAPI event timeout threshold reached".into());
+        match event_handle.wait_for_event(EVENT_TIMEOUT_MS) {
+            Ok(()) => consecutive_timeouts = 0,
+            Err(WasapiError::EventTimeout) => {
+                metrics.event_timeouts.fetch_add(1, Ordering::Relaxed);
+                consecutive_timeouts += 1;
+                max_consecutive_timeouts = max_consecutive_timeouts.max(consecutive_timeouts);
+                if consecutive_timeouts >= MAX_CONSECUTIVE_EVENT_TIMEOUTS {
+                    break Err("WASAPI event timeout threshold reached".into());
+                }
+                continue;
             }
-            continue;
+            Err(error) => break Err(Box::new(error)),
         }
-        consecutive_timeouts = 0;
         metrics.event_count.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         update_max_us(
