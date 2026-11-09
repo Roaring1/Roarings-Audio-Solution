@@ -10,4 +10,5 @@ roaring-mic-core = { path = "../roaring-mic-core" }
 [target.'cfg(windows)'.dependencies]
 rtrb = "0.4.1"
 wasapi = "0.27.0"
+socket2 = "0.6.5"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Threading"] }
