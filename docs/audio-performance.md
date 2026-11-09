@@ -28,7 +28,11 @@ The current measured baseline is 48 kHz with a 512-frame PipeWire graph quantum:
 
 A 256-frame graph (5.33 ms) was exercised, but it produced additional Scarlett xruns under the machine's normal load. The safe default is therefore 512 frames. ROARING_MIC_MIN_QUANTUM=256 is an explicit opt-in for further trials, not the default. A new xrun steps the graph up (256 -> 512 -> 1024); the sender's monitor retries lower settings only after a clean interval. Carla's session applies the 512-frame graph force after its JACK node appears, so a Carla restart does not silently restore the 1024-frame default.
 
-The graph period is not the whole end-to-end delay. The plugin rack reports 260 samples of processing latency (about 5.42 ms at 48 kHz), and the Windows receiver deliberately holds two packets initially to preserve quality. Those stages must be measured separately before reducing their safety margin.
+The graph period is not the whole end-to-end delay. Carla reports 260 samples of plugin latency (about 5.42 ms at 48 kHz). The saved rack has two visible lookahead settings: LSP Gate Mono at 0.5 ms and LSP Limiter Mono at 5 ms. Their combined configured lookahead is 5.5 ms, close to Carla's 5.42 ms report, so they are strong candidates for most of the plugin delay. This is not yet an isolated per-plugin measurement.
+
+The LSP manual states that the limiter's lookahead buffer is added to output latency: https://lsp-plug.in/?page=manuals&section=limiter_mono. Do not lower it just to make the number smaller. A shorter lookahead can reduce the limiter's ability to catch fast peaks. The next useful experiment is an A/B using the same recorded loud speech/transient sample, first comparing the current 0.5/5 ms gate/limiter settings with a conservative 0.25/2 ms candidate. Record true peaks, clipping, loudness, and blind-listening quality. Do this on a copy of the Carla project or an isolated test graph; leave the live preset unchanged until the candidate passes.
+
+The Windows receiver deliberately holds two packets initially to preserve quality. That queue and the plugin lookahead should be measured separately before reducing their safety margin.
 
 ## Carla: one engine, not two
 
