@@ -152,6 +152,12 @@ class CommandReceiverTests(unittest.TestCase):
         self.assertFalse(receiver.allowed_peer(("192.168.50.124", 54000)))
         self.assertFalse(receiver.allowed_peer(None))
 
+    def test_legacy_b2_source_file_cannot_redirect_b1_mute_controls(self):
+        legacy_state = self.root / ".config/roaring/mic_source"
+        legacy_state.parent.mkdir(parents=True, exist_ok=True)
+        legacy_state.write_text("b2_mic\n")
+        self.assertEqual(receiver.current_source(), "b1_mic")
+
     def test_intentionally_unrouted_bus_is_confirmed_not_pending(self):
         receiver._write_conf({"B1_ACTIVE": "false"})
         with mock.patch.object(receiver, "applied_mic", return_value=None), mock.patch.object(
