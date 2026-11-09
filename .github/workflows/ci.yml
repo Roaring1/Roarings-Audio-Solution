@@ -27,6 +27,10 @@ jobs:
           bash -n Bin/roaring_mic_routesd.sh
           bash -n Bin/roaring_moonlight_micd.sh
           bash -n Bin/roaring_mic_bussesd.sh
+          bash -n Bin/roaring_carla_launch.sh
+          bash -n Bin/roaring_carla_stop_stale.sh
+          bash -n Bin/roaring_carla_wait_ready.sh
+          bash -n Bin/roaring_carla_set_quantum.sh
 
   windows:
     name: Windows receiver validation

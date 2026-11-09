@@ -98,6 +98,32 @@ $at200 = @(
 Assert-True (($at200 -join ',') -eq '-32768,-32768,0,32767,32767') '200 percent gain saturation'
 Assert-True ([WaveRouter]::GetClippedSamples() -eq 3) '200 percent clipping counter'
 
+# Adaptive packet buffering stays at the low floor under normal timing, grows
+# quickly when a datagram is late, and never exceeds the bounded device queue.
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 10.5, 10.0, 2, 8) -eq 2) 'adaptive buffer preserves low floor for normal packet timing'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 16.0, 10.0, 2, 8) -eq 3) 'adaptive buffer grows after delayed packet'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 25.0, 10.0, 2, 8) -eq 4) 'adaptive buffer grows after a second severe delay'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 100.0, 10.0, 2, 8) -eq 8) 'adaptive buffer clamps severe delay to queue cap'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 0.0, 10.0, 2, 8) -eq 2) 'adaptive buffer enforces minimum floor'
+Assert-True (-not [WaveRouter]::IsPacketArrivalLate(5.3, 5.0)) 'normal packet-boundary completion is not classified as late'
+Assert-True (-not [WaveRouter]::IsPacketArrivalLate(6.9, 5.0)) 'small scheduling variation is tolerated'
+Assert-True ([WaveRouter]::IsPacketArrivalLate(7.1, 5.0)) 'late packet gap is detected'
+Assert-True ($source.Contains('inFlight == 0 && LastArrivalWasLate')) 'natural WaveOut packet completion does not count as underrun'
+Assert-True ($source.Contains('StableArrivalCount >= 6000')) 'adaptive buffer reduction requires sustained stability'
+
+[WaveRouter]::AdaptiveBuffering = $true
+[WaveRouter]::ConfiguredPreBuf = 5
+[WaveRouter]::ResetCounters()
+Assert-True ([WaveRouter]::PreBuf -eq 2) 'automatic mode starts at two packet floor'
+[WaveRouter]::AdaptiveBuffering = $false
+[WaveRouter]::ConfiguredPreBuf = 5
+[WaveRouter]::ResetCounters()
+Assert-True ([WaveRouter]::PreBuf -eq 5) 'manual mode honors configured prebuffer'
+[WaveRouter]::AdaptiveBuffering = $true
+Assert-True ($source -match 'const int NBUF = MaxAutoPreBuf;') 'WaveOut queue depth is bounded to adaptive maximum'
+Assert-True ($source.Contains('udp.Client.ReceiveBufferSize = 8192;')) 'UDP receive buffer is bounded for low latency'
+Assert-True ($source.Contains('[Math]::Min(8,[int]$Cfg.PreBufPkts)')) 'manual prebuffer config is clamped to bounded maximum'
+
 [WaveRouter]::ResetCounters()
 [WaveRouter]::AllowedSourceIP = '192.168.50.123'
 Assert-True ([WaveRouter]::IsAcceptedPacket([byte[]]@(0,1), '192.168.50.123')) 'valid configured-source packet'

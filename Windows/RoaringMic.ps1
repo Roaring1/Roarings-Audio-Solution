@@ -26,7 +26,7 @@ $AppDir  = "$env:LOCALAPPDATA\RoaringMic"
 $CfgPath = "$AppDir\config.json"
 $null    = New-Item $AppDir -ItemType Directory -Force -EA SilentlyContinue
 
-$Cfg = [PSCustomObject]@{ Port = 46001; Rate = 48000; PcHost = '192.168.50.123'; PreBufPkts = 5; Volume = 100 }
+$Cfg = [PSCustomObject]@{ Port = 46001; Rate = 48000; PcHost = '192.168.50.123'; PreBufMode = 'auto'; PreBufPkts = 5; Volume = 100 }
 if (Test-Path $CfgPath) {
     try {
         $j = Get-Content $CfgPath -Raw | ConvertFrom-Json
@@ -37,7 +37,7 @@ try { $Cfg.Volume = [Math]::Max(0,[Math]::Min(200,[int]$Cfg.Volume)) }
 catch { $Cfg.Volume = 100 }
 try { $Cfg.Port = [Math]::Max(1,[Math]::Min(65535,[int]$Cfg.Port)) }
 catch { $Cfg.Port = 46001 }
-try { $Cfg.PreBufPkts = [Math]::Max(1,[Math]::Min(16,[int]$Cfg.PreBufPkts)) }
+try { $Cfg.PreBufPkts = [Math]::Max(1,[Math]::Min(8,[int]$Cfg.PreBufPkts)) }
 catch { $Cfg.PreBufPkts = 5 }
 try {
     $parsedPc = [System.Net.IPAddress]::Parse([string]$Cfg.PcHost)
@@ -47,6 +47,7 @@ try {
 
 Add-Type -TypeDefinition @'
 using System;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
@@ -106,9 +107,63 @@ public static class WaveRouter {
     public static string DeviceNeedle = "CABLE";
     public static int    Port         = 46001;
     public static int    Rate         = 48000;
-    public static int    PreBuf       = 5;
-    public static volatile int  Underruns = 0;
-    public static volatile bool Primed    = false;
+    public static volatile int PreBuf = 5;
+    public static int ConfiguredPreBuf = 5;
+    public static volatile bool AdaptiveBuffering = true;
+    public static volatile float ArrivalJitterMs = 0f;
+    public static volatile bool LastArrivalWasLate = false;
+    public static volatile int Underruns = 0;
+    public static volatile bool Primed = false;
+    private static long LastArrivalStopwatchTicks = 0;
+    private static double LastPacketDurationMs = 0.0;
+    private static int StableArrivalCount = 0;
+    public const int MinAutoPreBuf = 2;
+    public const int MaxAutoPreBuf = 8;
+
+    public static bool IsPacketArrivalLate(double intervalMs, double packetMs) {
+        if (intervalMs <= 0.0 || packetMs <= 0.0) return false;
+        return intervalMs > packetMs + Math.Max(2.0, packetMs * 0.25);
+    }
+
+    public static int CalculateAdaptivePreBuf(int current, double intervalMs,
+        double packetMs, int min, int max) {
+        if (min < 1) min = 1;
+        if (max < min) max = min;
+        current = Math.Max(min, Math.Min(max, current));
+        if (intervalMs <= 0.0 || packetMs <= 0.0) return current;
+        if (!IsPacketArrivalLate(intervalMs, packetMs)) return current;
+        int needed = (int)Math.Ceiling(intervalMs / packetMs);
+        return Math.Min(max, Math.Max(current + 1, Math.Max(min, needed)));
+    }
+
+    private static void ObservePacketArrival(int packetBytes) {
+        long now = Stopwatch.GetTimestamp();
+        long previous = Interlocked.Exchange(ref LastArrivalStopwatchTicks, now);
+        double packetMs = packetBytes * 500.0 / Rate;
+        if (previous > 0 && LastPacketDurationMs > 0.0) {
+            double intervalMs = (now - previous) * 1000.0 / Stopwatch.Frequency;
+            double deviation = Math.Abs(intervalMs - LastPacketDurationMs);
+            ArrivalJitterMs = (float)(ArrivalJitterMs * 0.875 + deviation * 0.125);
+            LastArrivalWasLate = IsPacketArrivalLate(intervalMs, LastPacketDurationMs);
+            if (AdaptiveBuffering) {
+                int next = CalculateAdaptivePreBuf(PreBuf, intervalMs,
+                    LastPacketDurationMs, MinAutoPreBuf, MaxAutoPreBuf);
+                if (next > PreBuf) {
+                    PreBuf = next;
+                    StableArrivalCount = 0;
+                } else if (!LastArrivalWasLate) {
+                    StableArrivalCount++;
+                    if (StableArrivalCount >= 6000 && PreBuf > MinAutoPreBuf) {
+                        PreBuf--;
+                        StableArrivalCount = 0;
+                    }
+                } else {
+                    StableArrivalCount = 0;
+                }
+            }
+        }
+        LastPacketDurationMs = packetMs;
+    }
 
     public static bool HasCableDevice() {
         uint n = waveOutGetNumDevs();
@@ -123,7 +178,14 @@ public static class WaveRouter {
 
     public static void ResetCounters() {
         PktsReceived = 0; PktsDropped = 0; PktsRejected = 0; SourceIP = "--";
+        Underruns = 0; Primed = false; ArrivalJitterMs = 0f;
+        LastArrivalWasLate = false;
         Interlocked.Exchange(ref ClippedSamples, 0);
+        Interlocked.Exchange(ref LastArrivalStopwatchTicks, 0);
+        LastPacketDurationMs = 0.0; StableArrivalCount = 0;
+        PreBuf = AdaptiveBuffering
+            ? MinAutoPreBuf
+            : Math.Max(1, Math.Min(MaxAutoPreBuf, ConfiguredPreBuf));
     }
 
     public static short ScalePcmSample(short sample) {
@@ -153,7 +215,7 @@ public static class WaveRouter {
         if (!Running) return;
         VuLevel = 0f; LastError = null; Primed = false; Underruns = 0;
         Interlocked.Exchange(ref LastPacketTicks, 0);
-        const int NBUF = 24; const int BUFSZ = 8192;
+        const int NBUF = MaxAutoPreBuf; const int BUFSZ = 8192;
 
         int devIdx = -1;
         uint numDevs = waveOutGetNumDevs();
@@ -188,6 +250,10 @@ public static class WaveRouter {
                 hdrPtrs[i] = Marshal.AllocHGlobal(hSz);
             }
             udp = new UdpClient(Port);
+            // Keep the kernel from accumulating seconds of stale microphone
+            // audio if this worker is descheduled. At 48 kHz mono s16le, 8 KiB
+            // is about 85 ms; the adaptive WaveOut queue handles short jitter.
+            udp.Client.ReceiveBufferSize = 8192;
             udp.Client.ReceiveTimeout = 500;
             var ep = new IPEndPoint(IPAddress.Any, 0);
             while (Running) {
@@ -205,6 +271,7 @@ public static class WaveRouter {
 
                 SourceIP = ep.Address.ToString();
                 Interlocked.Exchange(ref LastPacketTicks, DateTime.UtcNow.Ticks);
+                ObservePacketArrival(pkt.Length);
                 PktsReceived++;
 
                 float sumSq = 0f; int nSamples = pkt.Length / 2;
@@ -231,7 +298,19 @@ public static class WaveRouter {
                         waveOutUnprepareHeader(hwo, hdrPtrs[i], (uint)hSz); busy[i] = false;
                     } else { inFlight++; }
                 }
-                if (Primed && inFlight == 0) { Primed = false; Underruns++; }
+                // A packet-sized WaveOut buffer normally completes just as
+                // the next on-time datagram arrives. That is not an underrun:
+                // keep the stream primed and immediately queue the new packet.
+                // Only re-prime and grow the buffer when the measured arrival
+                // gap exceeds one packet duration plus the scheduling tolerance.
+                if (Primed && inFlight == 0 && LastArrivalWasLate) {
+                    Primed = false;
+                    Underruns++;
+                    if (AdaptiveBuffering && PreBuf < MaxAutoPreBuf) {
+                        PreBuf++;
+                        StableArrivalCount = 0;
+                    }
+                }
                 if (!Primed) {
                     if (hold.Count < PreBuf) continue;
                     Primed = true;
@@ -319,7 +398,8 @@ function Start-Recv {
     }
     try {
         [WaveRouter]::DeviceNeedle = 'CABLE'; [WaveRouter]::Port = $Cfg.Port; [WaveRouter]::Rate = $Cfg.Rate
-        [WaveRouter]::PreBuf = [int]$Cfg.PreBufPkts
+        [WaveRouter]::AdaptiveBuffering = ([string]$Cfg.PreBufMode -ne 'manual')
+        [WaveRouter]::ConfiguredPreBuf = [int]$Cfg.PreBufPkts
         [WaveRouter]::AllowedSourceIP = [string]$Cfg.PcHost
         [WaveRouter]::ResetCounters()
         # Arm before dispatch so an immediate Stop cannot be overwritten by
@@ -821,7 +901,9 @@ function Refresh-Flyout {
             $under = [WaveRouter]::Underruns
             $bad = [WaveRouter]::GetRejectedPackets()
             $clip = [WaveRouter]::GetClippedSamples()
-            $script:StatsLbl.Text      = "$pps/s  drop:$drops  bad:$bad  under:$under  clip:$clip"
+            $buf = [WaveRouter]::PreBuf
+            $jit = [Math]::Round([WaveRouter]::ArrivalJitterMs, 1)
+            $script:StatsLbl.Text      = "$pps/s  buf:$buf  jit:$($jit)ms  drop:$drops  bad:$bad  under:$under  clip:$clip"
             $script:StatsLbl.ForeColor = if ($drops -gt 0 -or $bad -gt 0 -or $under -gt 0 -or $clip -gt 0) { $ColorWarn } else { [SystemColors]::GrayText }
         } else {
             $script:StatsLbl.Text      = '-- pkt/s  .  -- drops'
