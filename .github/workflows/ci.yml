@@ -1,0 +1,38 @@
+name: Audio solution CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux audio scripts and command protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Python regression suite
+        run: python -m unittest discover -s tests -v
+      - name: Compile Python assets
+        run: python -m compileall -q Bin tests
+      - name: Validate Bash scripts
+        run: |
+          bash -n Bin/roaring_mic_routesd.sh
+          bash -n Bin/roaring_moonlight_micd.sh
+          bash -n Bin/roaring_mic_bussesd.sh
+
+  windows:
+    name: Windows receiver validation
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse, compile and exercise receiver DSP/packet filters
+        shell: powershell
+        run: .\Windows\Tests\Validate-RoaringMic.ps1

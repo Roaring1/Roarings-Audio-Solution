@@ -22,7 +22,7 @@ exec >>"$LOG" 2>&1
 # This guardian heals by NAME via pactl, so it is immune to the node-ID churn
 # that broke the audit's proposed by-ID `wpctl set-default` oneshot, and it
 # re-asserts within one loop if anything (or WirePlumber state) flips it back.
-# Override in ~/.config/roaring_mixer.conf with e.g. DEFAULT_SOURCE="b2_mic".
+# Override in ~/.config/hearth/roaring_mixer.conf with e.g. DEFAULT_SOURCE="b2_mic".
 DEFAULT_SOURCE="${DEFAULT_SOURCE:-b1_mic}"
 
 log() { echo "[mic-bus] $(date +%H:%M:%S) $*"; }

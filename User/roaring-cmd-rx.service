@@ -1,0 +1,15 @@
+[Unit]
+Description=Roaring Mic command receiver (Windows → Linux UDP 46002)
+After=network.target pipewire.service pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/bin/roaring_cmd_rxd.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:%h/.cache/roaring-cmd-rxd.log
+StandardError=append:%h/.cache/roaring-cmd-rxd.log
+
+[Install]
+WantedBy=default.target
