@@ -7,6 +7,7 @@
 pub mod adaptive;
 pub mod gain;
 pub mod pcm;
+pub mod profile;
 
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CHANNELS: u16 = 1;

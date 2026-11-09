@@ -99,6 +99,7 @@ Implementation:
 - MMCSS Pro Audio scheduling, Audio fallback, then restored AboveNormal priority if MMCSS is unavailable.
 - Neutral Windows `Other` stream category to avoid communications ducking.
 - Adaptive re-prime after an actual output underrun. The safe floor increases by one packet at most every five seconds. The queue ceiling grows with the learned floor but still discards old samples rather than allowing stale audio to build up.
+- A versioned learned-floor profile at `%LOCALAPPDATA%\RoaringMic\wasapi-safe-floor-v1.ini`, keyed by sender IP, local UDP bind address/port, WASAPI endpoint ID, sample rate, requested period, actual engine buffer and packet size. A matching profile is loaded after the first valid packet on a new session. Corrupt, oversized or mismatched profiles fail closed to the four-packet baseline. Each real underrun-driven increase is queued to a dedicated non-real-time writer and atomically persisted with a recoverable backup; the WASAPI render thread performs no file I/O. The floor relaxes by only one packet after ten minutes without underruns, event timeouts, invalid/rejected packets, socket drops or stale-queue trimming.
 - `--udp --silent` submits silence to the shared CABLE Input render endpoint. Real microphone PCM reaches that endpoint only when `--render` is explicitly passed. The existing WaveOut task remained the only production path carrying microphone audio during the parallel tests.
 
 Measured on the laptop at 48 kHz, 128-frame WASAPI period, 280-frame engine buffer, with 1,024-byte / 512-sample UDP packets:

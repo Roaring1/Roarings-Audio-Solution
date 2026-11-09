@@ -5,17 +5,22 @@
 //! silent output so a parallel test cannot duplicate the live microphone.
 
 use std::error::Error;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use roaring_mic_core::adaptive::{
-    next_safe_floor, prebuffer_target_samples, queue_ceiling_samples,
+    may_relax_safe_floor, next_safe_floor, prebuffer_target_samples, queue_ceiling_samples,
 };
 use roaring_mic_core::gain::scale_sample;
 use roaring_mic_core::pcm::RawPcmPacket;
+use roaring_mic_core::profile::{decode_queue_profile, encode_queue_profile, QueueProfileKey};
 use roaring_mic_core::{MAX_PCM_DATAGRAM_BYTES, SAMPLE_RATE_HZ};
 use rtrb::{Consumer, Producer, RingBuffer};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -41,6 +46,7 @@ const QUEUE_CAPACITY_SAMPLES: usize = 8_192;
 const UDP_RECEIVE_BUFFER_BYTES: usize = 4_096;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_QUEUE_PROFILE_BYTES: u64 = 4_096;
 const EVENT_TIMEOUT_MS: u32 = 100;
 const MAX_CONSECUTIVE_EVENT_TIMEOUTS: u32 = 20;
 const FLOOR_RAISE_INTERVAL: Duration = Duration::from_secs(5);
@@ -227,6 +233,18 @@ struct Metrics {
     max_arrival_interval_us: AtomicU64,
     max_event_interval_us: AtomicU64,
     safe_floor_packets: AtomicUsize,
+}
+
+fn quality_problem_snapshot(metrics: &Metrics) -> [u64; 7] {
+    [
+        metrics.underrun_events.load(Ordering::Relaxed),
+        metrics.event_timeouts.load(Ordering::Relaxed),
+        metrics.rejected_sources.load(Ordering::Relaxed),
+        metrics.rejected_packets.load(Ordering::Relaxed),
+        metrics.packet_size_changes.load(Ordering::Relaxed),
+        metrics.queue_dropped_packets.load(Ordering::Relaxed),
+        metrics.stale_samples_discarded.load(Ordering::Relaxed),
+    ]
 }
 
 fn update_max_us(target: &AtomicU64, value: u64) {
@@ -424,6 +442,139 @@ fn validate_period(
         ).into());
     }
     Ok(())
+}
+
+fn queue_profile_path() -> Option<PathBuf> {
+    let directory = std::env::var_os("ROARING_MIC_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("LOCALAPPDATA").map(|value| PathBuf::from(value).join("RoaringMic"))
+        })?;
+    Some(directory.join("wasapi-safe-floor-v1.ini"))
+}
+
+fn read_queue_profile(path: &std::path::Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_QUEUE_PROFILE_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    file.take(MAX_QUEUE_PROFILE_BYTES + 1)
+        .read_to_string(&mut contents)
+        .ok()?;
+    if contents.len() as u64 > MAX_QUEUE_PROFILE_BYTES {
+        return None;
+    }
+    Some(contents)
+}
+
+fn load_persisted_safe_floor(key: &QueueProfileKey, configured_floor: u8) -> u8 {
+    let Some(path) = queue_profile_path() else {
+        return configured_floor;
+    };
+    let backup = path.with_extension("bak");
+    for candidate in [&path, &backup] {
+        let Some(contents) = read_queue_profile(candidate) else {
+            continue;
+        };
+        if let Some(saved_floor) = decode_queue_profile(&contents, key, MAX_PREBUFFER_PACKETS) {
+            return saved_floor.max(configured_floor).min(MAX_PREBUFFER_PACKETS);
+        }
+    }
+    configured_floor
+}
+
+fn save_persisted_safe_floor(key: &QueueProfileKey, safe_floor: u8) -> Result<(), Box<dyn Error>> {
+    let path =
+        queue_profile_path().ok_or("LOCALAPPDATA is unavailable; safe floor cannot persist")?;
+    let parent = path.parent().ok_or("invalid safe-floor profile path")?;
+    fs::create_dir_all(parent)?;
+
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let backup = path.with_extension("bak");
+    let contents = encode_queue_profile(key, safe_floor);
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    if path.exists() {
+        let _ = fs::remove_file(&backup);
+        if let Err(error) = fs::rename(&path, &backup) {
+            let _ = fs::remove_file(&temporary);
+            return Err(Box::new(error));
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(Box::new(error));
+    }
+    let _ = fs::remove_file(&backup);
+    Ok(())
+}
+
+struct ProfileWriteRequest {
+    key: QueueProfileKey,
+    safe_floor: u8,
+}
+
+struct ProfileWriter {
+    sender: Option<Sender<ProfileWriteRequest>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl ProfileWriter {
+    fn start() -> Option<Self> {
+        let (sender, receiver) = mpsc::channel::<ProfileWriteRequest>();
+        let join = match thread::Builder::new()
+            .name("RoaringMic profile persistence".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    if let Err(error) = save_persisted_safe_floor(&request.key, request.safe_floor)
+                    {
+                        eprintln!("WASAPI_PROFILE_SAVE_FAILED error={error}");
+                    } else {
+                        eprintln!("WASAPI_PROFILE_SAVED floor={} packets", request.safe_floor);
+                    }
+                }
+            }) {
+            Ok(join) => join,
+            Err(error) => {
+                eprintln!("WASAPI_PROFILE_WRITER_START_FAILED error={error}");
+                return None;
+            }
+        };
+        Some(Self {
+            sender: Some(sender),
+            join: Some(join),
+        })
+    }
+
+    fn save(&self, key: &QueueProfileKey, safe_floor: u8) {
+        if let Some(sender) = self.sender.as_ref() {
+            if let Err(error) = sender.send(ProfileWriteRequest {
+                key: key.clone(),
+                safe_floor,
+            }) {
+                eprintln!("WASAPI_PROFILE_QUEUE_FAILED error={error}");
+            }
+        }
+    }
+}
+
+impl Drop for ProfileWriter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(join) = self.join.take() {
+            if join.join().is_err() {
+                eprintln!("WASAPI_PROFILE_WRITER_PANICKED=true");
+            }
+        }
+    }
 }
 
 fn make_udp_socket(listen: SocketAddr) -> Result<UdpSocket, Box<dyn Error>> {
@@ -655,6 +806,7 @@ fn fill_render_buffer(
 
 fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
     let (device, mut client, mix) = open_target(&config.device_needle)?;
+    let device_id = device.get_id()?;
     client.set_properties(AudioClientProperties::new().set_category(StreamCategory::Other))?;
     validate_mix_format(&mix)?;
     let periods = client.get_shared_mode_engine_period(&mix)?;
@@ -681,14 +833,31 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
     let startup_deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut packet_samples = 0_usize;
     let mut target_samples = 0_usize;
+    let mut safe_floor = config.prebuffer_packets;
+    let mut profile_key: Option<QueueProfileKey> = None;
     while Instant::now() < startup_deadline {
         packet_samples = metrics.last_packet_samples.load(Ordering::Relaxed);
+        let packet_bytes = metrics.expected_packet_bytes.load(Ordering::Relaxed);
+        if packet_samples > 0 && packet_bytes > 0 && profile_key.is_none() {
+            let key = QueueProfileKey {
+                peer_ip: config.peer.to_string(),
+                listen_addr: config.listen.to_string(),
+                device_id: device_id.clone(),
+                sample_rate_hz: mix.get_samplespersec(),
+                period_frames: config.period_frames,
+                engine_buffer_frames: buffer_frames,
+                packet_bytes,
+            };
+            safe_floor = load_persisted_safe_floor(&key, config.prebuffer_packets);
+            metrics
+                .safe_floor_packets
+                .store(safe_floor as usize, Ordering::Relaxed);
+            profile_key = Some(key);
+            println!("WASAPI_PROFILE loaded_floor={safe_floor} packets packet_bytes={packet_bytes} device_id={device_id}");
+        }
         if packet_samples > 0 {
-            target_samples = prebuffer_target_samples(
-                packet_samples,
-                config.prebuffer_packets,
-                buffer_frames as usize,
-            );
+            target_samples =
+                prebuffer_target_samples(packet_samples, safe_floor, buffer_frames as usize);
             if consumer.slots() >= target_samples {
                 break;
             }
@@ -711,6 +880,11 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
             config.peer
         )
         .into());
+    }
+
+    let profile_writer = profile_key.as_ref().and_then(|_| ProfileWriter::start());
+    if profile_writer.is_none() {
+        eprintln!("WASAPI_PROFILE_PERSISTENCE_DISABLED=true");
     }
 
     let mut output = vec![0_u8; buffer_frames as usize * 8];
@@ -747,7 +921,7 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
         f64::from(config.period_frames) * 1_000.0 / f64::from(SAMPLE_RATE_HZ),
         buffer_frames,
         f64::from(buffer_frames) * 1_000.0 / f64::from(SAMPLE_RATE_HZ),
-        config.prebuffer_packets,
+        safe_floor,
         target_samples,
         QUEUE_CAPACITY_SAMPLES,
         config.gain_percent,
@@ -758,7 +932,8 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let mut last_event = Instant::now();
     let mut last_floor_raise = Instant::now() - FLOOR_RAISE_INTERVAL;
-    let mut safe_floor = config.prebuffer_packets;
+    let mut stable_since_us = 0_u64;
+    let mut last_quality_problems = quality_problem_snapshot(&metrics);
     let mut primed = true;
     let mut consecutive_timeouts = 0_u32;
     let mut max_consecutive_timeouts = 0_u32;
@@ -829,6 +1004,7 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
             .clipped_samples
             .fetch_add(clipped, Ordering::Relaxed);
         if missing > 0 {
+            stable_since_us = started.elapsed().as_micros() as u64;
             metrics.underrun_events.fetch_add(1, Ordering::Relaxed);
             metrics
                 .underrun_frames
@@ -844,6 +1020,9 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
                     .safe_floor_packets
                     .store(safe_floor as usize, Ordering::Relaxed);
                 last_floor_raise = now;
+                if let (Some(writer), Some(key)) = (profile_writer.as_ref(), profile_key.as_ref()) {
+                    writer.save(key, safe_floor);
+                }
                 eprintln!(
                     "WASAPI_REPRIME reason=output-underrun floor={} packets target={} samples",
                     safe_floor, target_samples
@@ -851,10 +1030,33 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
             }
         }
         render.write_to_device(&output[..available * 8], None)?;
+
+        let now_us = started.elapsed().as_micros() as u64;
+        let quality_problems = quality_problem_snapshot(&metrics);
+        if quality_problems != last_quality_problems {
+            stable_since_us = now_us;
+            last_quality_problems = quality_problems;
+        }
+        if safe_floor > config.prebuffer_packets && may_relax_safe_floor(now_us, stable_since_us) {
+            safe_floor = safe_floor.saturating_sub(1).max(config.prebuffer_packets);
+            target_samples =
+                prebuffer_target_samples(packet_samples, safe_floor, buffer_frames as usize);
+            metrics
+                .safe_floor_packets
+                .store(safe_floor as usize, Ordering::Relaxed);
+            stable_since_us = now_us;
+            if let (Some(writer), Some(key)) = (profile_writer.as_ref(), profile_key.as_ref()) {
+                writer.save(key, safe_floor);
+                eprintln!(
+                    "WASAPI_PROFILE_RELAXED floor={safe_floor} packets after 10 clean minutes"
+                );
+            }
+        }
     };
 
     drop(_stream);
     receiver.shutdown();
+    drop(profile_writer);
     println!(
         "WASAPI_UDP_RESULT packets={} samples={} rejected_sources={} rejected_packets={} packet_size_changes={} queue_dropped={} stale_samples_discarded={} underrun_events={} underrun_frames={} rendered_frames={} clipped_samples={} events={} event_timeouts={} max_consecutive_timeouts={} max_queue_samples={} max_queue_ms={:.3} max_arrival_ms={:.3} max_event_ms={:.3} final_safe_floor={} packet_bytes={}",
         metrics.received_packets.load(Ordering::Relaxed),
@@ -962,6 +1164,72 @@ mod tests {
         let error =
             Config::parse(&["--prebuffer=9".to_owned()]).expect_err("prebuffer must be bounded");
         assert!(error.to_string().contains("between 1 and 8"));
+    }
+
+    #[test]
+    fn learned_safe_floor_is_persisted_per_connection_and_bad_state_fails_closed() {
+        use roaring_mic_core::profile::QueueProfileKey;
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "roaring-mic-profile-test-{}-{unique}",
+            std::process::id()
+        ));
+        let previous_state_dir = std::env::var_os("ROARING_MIC_STATE_DIR");
+        std::env::set_var("ROARING_MIC_STATE_DIR", &directory);
+
+        let key = QueueProfileKey {
+            peer_ip: "192.168.50.123".to_owned(),
+            listen_addr: "0.0.0.0:46003".to_owned(),
+            device_id: "CABLE Input endpoint test".to_owned(),
+            sample_rate_hz: 48_000,
+            period_frames: 128,
+            engine_buffer_frames: 280,
+            packet_bytes: 1_024,
+        };
+
+        let result = (|| -> Result<(), Box<dyn Error>> {
+            assert_eq!(load_persisted_safe_floor(&key, 4), 4);
+            let writer = ProfileWriter::start().expect("profile writer thread starts");
+            writer.save(&key, 5);
+            drop(writer);
+            assert_eq!(load_persisted_safe_floor(&key, 4), 5);
+            save_persisted_safe_floor(&key, 6)?;
+            assert_eq!(load_persisted_safe_floor(&key, 4), 6);
+
+            let mut other_peer = key.clone();
+            other_peer.peer_ip = "192.168.50.124".to_owned();
+            assert_eq!(load_persisted_safe_floor(&other_peer, 4), 4);
+
+            std::fs::write(
+                directory.join("wasapi-safe-floor-v1.ini"),
+                "corrupt partial state",
+            )?;
+            assert_eq!(load_persisted_safe_floor(&key, 4), 4);
+            std::fs::write(
+                directory.join("wasapi-safe-floor-v1.ini"),
+                vec![b'x'; (MAX_QUEUE_PROFILE_BYTES + 1) as usize],
+            )?;
+            assert_eq!(load_persisted_safe_floor(&key, 4), 4);
+
+            std::fs::write(
+                directory.join("wasapi-safe-floor-v1.bak"),
+                encode_queue_profile(&key, 6),
+            )?;
+            assert_eq!(load_persisted_safe_floor(&key, 4), 6);
+            Ok(())
+        })();
+
+        if let Some(previous) = previous_state_dir {
+            std::env::set_var("ROARING_MIC_STATE_DIR", previous);
+        } else {
+            std::env::remove_var("ROARING_MIC_STATE_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        result.expect("safe-floor persistence should round-trip and fail closed");
     }
 
     #[test]
