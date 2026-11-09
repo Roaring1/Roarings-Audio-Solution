@@ -20,11 +20,14 @@ MIC_SOURCE="${MIC_SOURCE:-b1_mic}"
 MIC_PORT="${MIC_PORT:-46001}"
 RATE=48000
 CHANNELS=1
-# Pulse fragment is mono s16le bytes. Auto aligns one packet to one PipeWire graph quantum.
+# Pulse fragments are mono s16le bytes. The UDP muxer is capped at 1316 bytes;
+# keep each audio datagram at 1024 bytes so one Pulse fragment remains one UDP
+# datagram. A 2048-byte graph-aligned fragment is split into 1316+732 bytes,
+# creating uneven packet cadence and corrupting the receiver's per-packet jitter model.
 PULSE_FRAGMENT_OVERRIDE="${PULSE_FRAGMENT_BYTES:-}"
 PULSE_FRAGMENT_BYTES=960
 PULSE_FRAGMENT_FALLBACK=0
-PULSE_FRAGMENT_MAX=4096
+PULSE_FRAGMENT_MAX=1024
 # Learned minimum stable graph period for this machine. Set
 # ROARING_MIC_MIN_QUANTUM=256 only to opt into further 5.33 ms trials.
 MIN_SAFE_QUANTUM="$(printenv ROARING_MIC_MIN_QUANTUM 2>/dev/null || echo 512)"
@@ -201,10 +204,9 @@ select_capture_fragment() {
   if [[ -z "$PULSE_FRAGMENT_OVERRIDE" && $PULSE_FRAGMENT_FALLBACK -eq 0 ]]; then
     if [[ "$quantum" =~ ^[0-9]+$ ]]; then
       if (( quantum <= 2048 )); then
-        # One complete graph quantum per datagram (mono s16le = 2 bytes/frame).
-        # Aligning payload duration with graph cadence avoids a systematic
-        # short-packet gap at the Windows WaveOut boundary (e.g. 10 ms payload
-        # arriving every 10.67 ms at a 512-frame graph).
+        # Start from a graph-aware duration, then cap at one MTU-safe 1024-byte
+        # PCM datagram. At a 1024-frame graph this yields two consistent
+        # 512-frame packets rather than an oversized block split by UDP pkt_size.
         PULSE_FRAGMENT_BYTES=$(( quantum * 2 ))
         if (( PULSE_FRAGMENT_BYTES < 480 )); then
           PULSE_FRAGMENT_BYTES=480
@@ -218,6 +220,11 @@ select_capture_fragment() {
     fi
   elif [[ ! "$quantum" =~ ^[0-9]+$ ]]; then
     quantum="unknown"
+  fi
+
+  if (( PULSE_FRAGMENT_BYTES > PULSE_FRAGMENT_MAX )); then
+    log "capping Pulse fragment $PULSE_FRAGMENT_BYTES bytes to MTU-safe $PULSE_FRAGMENT_MAX-byte UDP payload"
+    PULSE_FRAGMENT_BYTES="$PULSE_FRAGMENT_MAX"
   fi
 
   local fragment_ms
