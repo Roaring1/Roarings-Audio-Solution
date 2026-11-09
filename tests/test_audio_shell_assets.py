@@ -292,6 +292,11 @@ carla_pids
         self.assertNotIn("pkill -f", unit)
         self.assertNotIn("pgrep -f", unit)
 
+    def test_carla_poststart_preserves_learned_1024_frame_safe_floor(self):
+        helper = (ROOT / "Bin/roaring_carla_set_quantum.sh").read_text()
+        self.assertIn("mic-safe-quantum", helper)
+        self.assertIn("preserving learned Scarlett-safe 1024-frame graph floor", helper)
+
     def test_carla_service_unit_has_safe_headless_and_scoped_startup(self):
         unit = (ROOT / "User/roaring-carla-session.service").read_text()
         self.assertIn("ExecStartPre=%h/bin/roaring_carla_wait_ready.sh", unit)
@@ -344,6 +349,23 @@ esac
             self.assertIn("forced PipeWire graph quantum to 512", result.stdout)
             self.assertIn("-n settings 0 clock.force-quantum 512", log.read_text())
 
+            safe_dir = pathlib.Path(temp_dir) / ".config" / "roaring"
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            (safe_dir / "mic-safe-quantum").write_text("1024\n")
+            env = {
+                **os.environ,
+                "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+                "PW_METADATA_LOG": str(log),
+                "HOME": temp_dir,
+            }
+            result = subprocess.run(
+                ["bash", str(helper)], capture_output=True, text=True,
+                env=env, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("preserving learned Scarlett-safe 1024-frame graph floor", result.stdout)
+            self.assertIn("-n settings 0 clock.force-quantum 1024", log.read_text())
+
     def test_carla_wait_ready_helper_replaces_quoted_unit_commands(self):
         helper = (ROOT / "Bin/roaring_carla_wait_ready.sh").read_text()
         unit = (ROOT / "User/roaring-carla-session.service").read_text()
@@ -361,6 +383,36 @@ esac
         self.assertIn("default.clock.min-quantum   = 256", source)
         self.assertIn("default.clock.rate          = 48000", source)
         self.assertIn("resample.quality            = 10", source)
+
+    def test_pipewire_safe_quantum_persistence_is_atomic_and_private(self):
+        script_path = ROOT / "Bin/roaring_moonlight_micd.sh"
+        shell = r"""set -euo pipefail
+SAFE_QUANTUM_FILE="$SAFE_FILE"
+source <(sed -n '/^persist_safe_quantum() {/,/^}/p' "$SCRIPT_PATH")
+persist_safe_quantum 1024
+cat "$SAFE_QUANTUM_FILE"
+stat -c '%a' "$SAFE_QUANTUM_FILE"
+if persist_safe_quantum 300; then
+  echo "invalid value unexpectedly accepted" >&2
+  exit 1
+fi
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            safe_file = pathlib.Path(temp_dir) / "config" / "mic-safe-quantum"
+            result = subprocess.run(
+                ["bash", "-c", shell],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "SCRIPT_PATH": str(script_path),
+                    "SAFE_FILE": str(safe_file),
+                },
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "1024\n600\n")
+            self.assertEqual(safe_file.read_text(), "1024\n")
 
     def test_pipewire_xrun_monitor_helpers_parse_and_escalate(self):
         script_path = ROOT / "Bin/roaring_moonlight_micd.sh"

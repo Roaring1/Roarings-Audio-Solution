@@ -29,6 +29,7 @@ PULSE_FRAGMENT_MAX=1920
 # ROARING_MIC_MIN_QUANTUM=256 only to opt into further 5.33 ms trials.
 MIN_SAFE_QUANTUM="$(printenv ROARING_MIC_MIN_QUANTUM 2>/dev/null || echo 512)"
 case "$MIN_SAFE_QUANTUM" in 256|512|1024) ;; *) MIN_SAFE_QUANTUM=512 ;; esac
+SAFE_QUANTUM_FILE="$HOME/.config/roaring/mic-safe-quantum"
 RETRY_SEC=3
 # Recycle ffmpeg after this many resampler glitches (see MEMORY note below).
 GLITCH_LIMIT="${GLITCH_LIMIT:-3}"
@@ -89,6 +90,16 @@ next_pipewire_quantum_after_xrun() {
   fi
 }
 
+persist_safe_quantum() {
+  local value="$1" tmp
+  case "$value" in 256|512|1024) ;; *) return 1 ;; esac
+  mkdir -p "$(dirname "$SAFE_QUANTUM_FILE")"
+  tmp="$SAFE_QUANTUM_FILE.tmp.$$"
+  echo "$value" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SAFE_QUANTUM_FILE"
+}
+
 # Monitor only the active Scarlett capture node. One xrun steps the graph up.
 # 512 frames is the learned default minimum for this machine; set
 # ROARING_MIC_MIN_QUANTUM=256 to explicitly opt into q256 trials.
@@ -144,11 +155,13 @@ watch_pipewire_xruns() {
       if (( next > 0 )); then
         log "Scarlett capture xrun count increased at $quantum frames; raising PipeWire graph to $next frames"
         if pw-metadata -n settings 0 clock.force-quantum "$next" >/dev/null 2>&1; then
+          persist_safe_quantum "$next" || log "warning: could not persist safe graph quantum $next"
           kill "$ff" 2>/dev/null || true
           return 0
         fi
         log "could not apply fallback quantum $next; preserving current stream"
       else
+        persist_safe_quantum "$quantum" || log "warning: could not persist safe graph quantum $quantum"
         log "Scarlett capture xrun observed at maximum $quantum-frame profile; keeping current quantum"
       fi
     elif (( quantum > 256 && SECONDS - stable_since >= 600 )); then
@@ -156,6 +169,7 @@ watch_pipewire_xruns() {
       if (( next > 0 )); then
         log "ten minutes xrun-free at $quantum frames; cautiously retrying $next-frame profile (minimum=$MIN_SAFE_QUANTUM)"
         if pw-metadata -n settings 0 clock.force-quantum "$next" >/dev/null 2>&1; then
+          persist_safe_quantum "$next" || log "warning: could not persist safe graph quantum $next"
           kill "$ff" 2>/dev/null || true
           return 0
         fi

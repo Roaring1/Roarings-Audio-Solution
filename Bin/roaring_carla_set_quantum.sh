@@ -8,12 +8,24 @@ set -euo pipefail
 target="$(printenv ROARING_CARLA_QUANTUM 2>/dev/null || true)"
 [[ -n "$target" ]] || target=512
 case "$target" in
-  512|1024) ;;
+  256|512|1024) ;;
   *)
     echo "carla-post: invalid graph quantum '$target'; using safe default 512" >&2
     target=512
     ;;
 esac
+
+safe_file="$HOME/.config/roaring/mic-safe-quantum"
+if [[ "$target" == "512" && -r "$safe_file" ]]; then
+  saved="$(<"$safe_file")"
+  case "$saved" in
+    1024)
+      target=1024
+      echo "carla-post: preserving learned Scarlett-safe 1024-frame graph floor"
+      ;;
+    256|512) ;;
+  esac
+fi
 
 for attempt in $(seq 1 120); do
   if pw-cli ls Node 2>/dev/null | grep -Fq 'node.name = "Carla"'; then
