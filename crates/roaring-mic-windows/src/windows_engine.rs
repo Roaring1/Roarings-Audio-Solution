@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use roaring_mic_core::adaptive::{next_safe_floor, prebuffer_target_samples};
+use roaring_mic_core::adaptive::{
+    next_safe_floor, prebuffer_target_samples, queue_ceiling_samples,
+};
 use roaring_mic_core::gain::scale_sample;
 use roaring_mic_core::pcm::RawPcmPacket;
 use roaring_mic_core::{MAX_PCM_DATAGRAM_BYTES, SAMPLE_RATE_HZ};
@@ -33,10 +35,9 @@ const DEFAULT_DEVICE_NEEDLE: &str = "CABLE Input";
 const DEFAULT_LISTEN: &str = "0.0.0.0:46003";
 const DEFAULT_PEER: &str = "192.168.50.123";
 const DEFAULT_PERIOD_FRAMES: u32 = 128;
-const DEFAULT_PREBUFFER_PACKETS: u8 = 2;
+const DEFAULT_PREBUFFER_PACKETS: u8 = 4;
 const MAX_PREBUFFER_PACKETS: u8 = 8;
 const QUEUE_CAPACITY_SAMPLES: usize = 8_192;
-const MAX_QUEUED_PACKETS: usize = 4;
 const UDP_RECEIVE_BUFFER_BYTES: usize = 4_096;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_READ_TIMEOUT: Duration = Duration::from_millis(100);
@@ -790,7 +791,7 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
         last_event = now;
 
         let queued = consumer.slots();
-        let max_queue = packet_samples.saturating_mul(MAX_QUEUED_PACKETS);
+        let max_queue = queue_ceiling_samples(packet_samples, safe_floor, buffer_frames as usize);
         if queued > max_queue {
             let mut to_discard = queued - max_queue;
             while to_discard > 0 && consumer.pop().is_ok() {
@@ -935,4 +936,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         "select --probe, --silent-render-probe, or --udp (silent unless --render is supplied)"
             .into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_startup_floor_is_the_measured_stable_four_packets() {
+        let config = Config::parse(&[]).expect("default config is valid");
+        assert_eq!(config.prebuffer_packets, 4);
+        assert_eq!(config.period_frames, 128);
+        assert!(!config.render_audio);
+    }
+
+    #[test]
+    fn allows_explicit_one_packet_floor_for_controlled_experiments() {
+        let config = Config::parse(&["--prebuffer=1".to_owned()])
+            .expect("one-packet floor is allowed for controlled experiments");
+        assert_eq!(config.prebuffer_packets, 1);
+    }
+
+    #[test]
+    fn candidate_rejects_prebuffer_above_bounded_maximum() {
+        let error =
+            Config::parse(&["--prebuffer=9".to_owned()]).expect_err("prebuffer must be bounded");
+        assert!(error.to_string().contains("between 1 and 8"));
+    }
+
+    #[test]
+    fn rendering_requires_explicit_opt_in() {
+        let config = Config::parse(&["--udp".to_owned()]).expect("silent config is valid");
+        assert!(!config.render_audio);
+        let config = Config::parse(&["--udp".to_owned(), "--render".to_owned()])
+            .expect("explicit render config is valid");
+        assert!(config.render_audio);
+    }
 }

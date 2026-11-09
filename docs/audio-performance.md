@@ -28,7 +28,7 @@ The previous 2,048-byte Pulse capture block was split by FFmpeg's UDP muxer into
 
 The Windows VB-CABLE control panel reports a fixed 48 kHz rate and a 7,168-sample maximum allocation. A trial at 1,536 samples (three 512-sample packets / 32 ms) was rolled back after the production WaveOut receiver's counters increased during concurrent testing. The 3,072-sample setting (six packets / 64 ms) has been restored and visually confirmed; the maximum remains 7,168. The extra capture reader has been stopped. Keep 3,072 until an isolated capture-quality test can establish that a smaller VB-CABLE buffer is stable without disrupting the production receiver.
 
-The live WaveOut receiver matched the new 1,024-byte profile and reduced its arrival-jitter EWMA from about 13.4 ms to about 0.1-0.2 ms. A later 1,536-sample VB-CABLE trial caused underrun/drop growth and was rolled back to 3,072 samples. The receiver's current learned floor is eight packets, with 9 underruns and 34 drops total; those counters have remained unchanged across several subsequent health snapshots. Arrival stays near 10.5-10.7 ms with jitter around 0.1 ms, but the WaveOut queue remains about 64-75 ms and completion about 70-75 ms. Do not lower the learned floor on the production stream. The Rust WASAPI candidate is still under test.
+The live WaveOut receiver matched the new 1,024-byte profile and reduced its arrival-jitter EWMA from about 13.4 ms to about 0.1-0.2 ms. The 1,536-sample VB-CABLE trial was rolled back to 3,072 samples. During subsequent parallel testing, the receiver's cumulative counters reached 12 underruns and 50 drops; they remained unchanged across the latest two health windows. Packet arrival stays around 10.5-10.8 ms with about 0.1 ms jitter, but the WaveOut queue remains around 64-75 ms and completion around 64-77 ms. Do not lower the learned eight-packet floor on the production stream.
 
 
 
@@ -40,7 +40,7 @@ The graph period is not the whole end-to-end delay. Carla reports 260 samples of
 
 The LSP manual states that the limiter's lookahead buffer is added to output latency: https://lsp-plug.in/?page=manuals&section=limiter_mono. Do not lower it just to make the number smaller. A shorter lookahead can reduce the limiter's ability to catch fast peaks. The next useful experiment is an A/B using the same recorded loud speech/transient sample, first comparing the current 0.5/5 ms gate/limiter settings with a conservative 0.25/2 ms candidate. Record true peaks, clipping, loudness, and blind-listening quality. Do this on a copy of the Carla project or an isolated test graph; leave the live preset unchanged until the candidate passes.
 
-The production WaveOut receiver currently uses its learned eight-packet floor. The Rust candidate starts at two packets only after its own receive queue is proven healthy. Do not conflate the two queue policies or lower the production floor to match the candidate.
+The production WaveOut receiver currently uses its learned eight-packet floor. The Rust candidate defaults to four packets based on its own silent WASAPI run; this is a separate profile. Do not lower the production floor to match the candidate.
 
 ## Carla: one engine, not two
 
@@ -56,17 +56,7 @@ Rust is the preferred language for the two transport edges because they are the 
 
 ### Windows receiver candidate
 
-The current production receiver remains the PowerShell host with its embedded C# WaveOut engine. It is the known-good rollback. The Rust candidate uses:
-
-- `wasapi` and IAudioClient3 for event-driven shared-mode rendering. It does not take exclusive control of the audio endpoint.
-- `rtrb` for a bounded SPSC sample queue between a normal UDP thread and the render thread.
-- A 48 kHz stereo float WASAPI mix format, fed from the existing mono S16LE UDP wire format.
-- An exact sender-IP allow-list, strict datagram validation, MMCSS Pro Audio scheduling, and bounded event/queue/drop diagnostics.
-- Automatic re-priming with a one-step safe-floor increase after an actual output underrun. The initial floor is two packets; one packet is not the default.
-
-On the laptop, CABLE Input reports a 128-frame minimum shared period. The actual shared engine buffer at that request was 280 frames (5.83 ms). A parallel silent-output run received 2,816 packets in 30 seconds with no rejects, queue drops, event timeouts, or underrun frames at 128 frames/two packets. The one-packet run recorded one 128-frame underrun; the 256-frame/two-packet run was also clean but reported a 562-frame (11.71 ms) engine buffer. This is a measured pipeline result, not an acoustic end-to-end latency measurement. The Rust executable is not deployed and the WaveOut route remains active.
-
-The Windows build CI must compile the real MSVC binary and run the existing receiver tests before an artifact can be considered for laptop testing. The first laptop run should use `--silent` on an isolated UDP port while the WaveOut production receiver continues to provide the audible signal. Only after packet, queue, continuity, and long-duration tests pass should a controlled handover be attempted.
+The production receiver remains the PowerShell/C# WaveOut implementation. The Rust WASAPI candidate, its actual laptop test results, and its rollout gate are recorded in the dedicated section below. The Rust executable remains separate from the installed WaveOut task.
 
 ### Linux capture candidate
 
@@ -99,30 +89,42 @@ The objective is lower observed end-to-end latency while retaining quality, not 
 
 ## Rust WASAPI receiver candidate (not production)
 
-A separate Windows-only Rust executable is being developed under `crates/roaring-mic-windows`. The source now contains a silent-by-default UDP-to-WASAPI bridge and an independent UDP ingress probe. Both have passed Linux-side Windows-target type-check and strict Clippy; the new code still needs a fresh native Windows CI build and on-device packet-ingress test. It preserves the current 48 kHz mono S16LE UDP protocol and uses:
+A separate Windows-only Rust executable lives under `crates/roaring-mic-windows`. It now has a silent-by-default UDP-to-WASAPI bridge and an independent `--udp-probe` mode. The production PowerShell/C# WaveOut receiver remains installed and continues to own UDP 46001. The Rust candidate has only been exercised on isolated UDP 46003 and has never replaced the audible route.
 
-- `wasapi` for IAudioClient3 event-driven shared-mode rendering.
-- `rtrb` for a bounded single-producer/single-consumer sample ring.
-- A dedicated UDP thread with an exact sender-IP allow-list and packet validation.
-- MMCSS `Pro Audio` scheduling for the render thread, with `Audio` and restored AboveNormal fallbacks. The stream uses the neutral `Other` category so it does not request Communications ducking of unrelated Windows audio.
-- A 4 KiB kernel UDP receive buffer and bounded SPSC queue; queue depth is capped to four packets by discarding stale samples rather than building seconds of delayed audio.
-- A two-packet startup floor, automatic re-priming after actual output underruns, and one-packet safe-floor growth at most every five seconds.
-- Exact sender-IP filtering and packet-size locking for each session. Variable-size 1,316+732 split datagrams are rejected instead of corrupting packet-duration estimates.
-- `--udp --silent` consumes real UDP data and drives the WASAPI event loop but outputs silence. Actual microphone rendering requires an explicit `--render` argument. This permits a parallel test while the existing microphone signal remains the only audible stream.
-- `--udp-probe` tests the exact Rust UDP socket and PCM parser without initializing WASAPI, and reports accepted/rejected packet counts and packet-size consistency. Use it to separate network-ingress failures from device/render failures.
+Implementation:
+
+- `wasapi` / IAudioClient3, event-driven shared-mode rendering at 128 frames. The laptop's actual engine buffer at this request is 280 frames (5.83 ms); the period itself is 2.67 ms.
+- A 48 kHz stereo-float WASAPI mix format fed from the existing mono S16LE wire protocol.
+- `rtrb` bounded SPSC sample queue, 4 KiB OS UDP receive buffer, exact source-IP allow-list, strict raw PCM validation, and packet-size locking per session.
+- MMCSS Pro Audio scheduling, Audio fallback, then restored AboveNormal priority if MMCSS is unavailable.
+- Neutral Windows `Other` stream category to avoid communications ducking.
+- Adaptive re-prime after an actual output underrun. The safe floor increases by one packet at most every five seconds. The queue ceiling grows with the learned floor but still discards old samples rather than allowing stale audio to build up.
+- `--udp --silent` submits silence to the shared CABLE Input render endpoint. Real microphone PCM reaches that endpoint only when `--render` is explicitly passed. The existing WaveOut task remained the only production path carrying microphone audio during the parallel tests.
+
+Measured on the laptop at 48 kHz, 128-frame WASAPI period, 280-frame engine buffer, with 1,024-byte / 512-sample UDP packets:
+
+| Rust run | Duration | Accepted packets | Output underruns | Final floor | Queue drops | Result |
+|---|---:|---:|---:|---:|---:|---|
+| Two-packet start | 30 s | 2,673 | 2 | 4 | 0 | Raised itself to four |
+| Three-packet start | 60 s | 5,627 | 2 | 5 | 0 | Raised itself to five |
+| Four-packet start | 60 s | 5,630 | 0 | 4 | 0 | Clean silent run |
+
+The four-packet run also had zero rejected sources, malformed packets, packet-size changes, and WASAPI event timeouts. It discarded 360 stale samples (7.5 ms) to bound queue age; maximum observed queue was 2,304 samples (48 ms), maximum packet arrival interval 27.8 ms, and maximum WASAPI event interval 11.9 ms. The four-packet candidate floor is now the default. Two- and three-packet tests demonstrate why lower settings are not the default on this connection.
+
+The standalone Rust UDP probe independently accepted `2,556/2,556` 1,024-byte packets over 45 seconds, with zero source or PCM rejects and an observed maximum arrival gap of 11.7 ms. That separates the transport path from the WASAPI renderer and confirms the packet parser/firewall route works.
+
+These are synthetic/silent transport and render tests, not an acoustic end-to-end microphone latency measurement. They do not prove real-audio quality through VB-CABLE. The candidate still needs a controlled, short real-audio handover with an immediate WaveOut rollback, followed by a longer quality soak, before it can replace WaveOut. Do not lower the production WaveOut floor or alter the current cable buffer to accelerate this work.
 
 ### Windows endpoint measurements
 
-The Windows laptop reports these IAudioClient3 shared-mode capabilities at 48 kHz:
+The laptop's IAudioClient3 shared-mode capabilities at 48 kHz:
 
 | Endpoint | Minimum | Default |
 |---|---:|---:|
 | CABLE Input (render) | 128 frames / 2.67 ms | 480 frames / 10 ms |
 | CABLE Output (capture) | 480 frames / 10 ms | 480 frames / 10 ms |
 
-A WASAPI event-driven capability test on CABLE Input at 128 frames reported a 280-frame engine buffer (5.83 ms), with roughly 2.02 ms median and 2.66 ms p95 event wake intervals. An earlier isolated C# UDP-to-WASAPI probe received 2,816 packets in 30 seconds with no wrong-source packets, queue drops, event timeouts, or underrun frames using a two-packet prebuffer. A one-packet run received the same packet count but recorded one 128-frame output underrun. A 256-frame run also had zero underruns, but its engine buffer was 562 frames (11.71 ms). These were silent-output tests; they did not duplicate the live microphone into the cable. They validate the endpoint and transport, not the Rust receiver currently being built.
-
-The Rust candidate is configured for 128-frame shared-mode rendering and a two-packet floor. One packet is not the default. The Rust source now implements the UDP bridge, but its native MSVC build and on-device silent-UDP test must pass after the latest bridge commit. The C# probe results above are reference measurements only. None of these tests is an acoustic end-to-end latency measurement. The candidate has not replaced WaveOut. A recent on-device run bound port 46003 but failed its five-second startup queue gate with no accepted samples, even though a separate .NET diagnostic listener received 40 valid 1,024-byte packets from the PC on the same port. A standalone Rust `--udp-probe` has now been added to isolate the socket/parser from WASAPI and provide packet acceptance diagnostics. Do not install or hand over the Rust candidate until that ingress test passes, followed by sustained silent testing, controlled real-audio handover, and rollback.
+A 256-frame render request produced a 562-frame engine buffer (11.71 ms), so it was not lower latency in practice than the 128-frame request. These are driver/endpoint values, not acoustic measurements.
 
 ### Build checks
 

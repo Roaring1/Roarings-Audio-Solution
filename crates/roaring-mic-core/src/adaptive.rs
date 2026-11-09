@@ -41,6 +41,19 @@ pub fn prebuffer_target_samples(
         .max(engine_buffer_frames)
 }
 
+/// Bound queued audio to the active safety floor, never below the device's
+/// entire shared-mode buffer. The limit must grow with the learned floor or a
+/// re-prime target above the old cap can never be reached.
+pub fn queue_ceiling_samples(
+    packet_samples: usize,
+    safe_floor_packets: u8,
+    engine_buffer_frames: usize,
+) -> usize {
+    packet_samples
+        .saturating_mul(usize::from(safe_floor_packets.max(1)))
+        .max(engine_buffer_frames)
+}
+
 pub const SAFE_FLOOR_RELAX_AFTER_US: u64 = 600_000_000;
 
 pub fn may_relax_safe_floor(now_us: u64, stable_since_us: u64) -> bool {
@@ -91,6 +104,26 @@ mod tests {
     #[test]
     fn prebuffer_target_never_overflows_on_large_packet_counts() {
         assert_eq!(prebuffer_target_samples(usize::MAX, 8, 280), usize::MAX);
+    }
+
+    #[test]
+    fn queue_ceiling_tracks_two_packet_floor() {
+        assert_eq!(queue_ceiling_samples(512, 2, 280), 1_024);
+    }
+
+    #[test]
+    fn queue_ceiling_grows_with_learned_five_packet_floor() {
+        assert_eq!(queue_ceiling_samples(512, 5, 280), 2_560);
+    }
+
+    #[test]
+    fn queue_ceiling_never_falls_below_engine_buffer() {
+        assert_eq!(queue_ceiling_samples(128, 2, 480), 480);
+    }
+
+    #[test]
+    fn queue_ceiling_saturates_on_large_profiles() {
+        assert_eq!(queue_ceiling_samples(usize::MAX, 8, 480), usize::MAX);
     }
 
     #[test]
