@@ -1,5 +1,8 @@
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+$root = $PSScriptRoot
+if (-not (Test-Path -LiteralPath (Join-Path $root 'RoaringMic.ps1'))) {
+    $root = Split-Path -Parent $PSScriptRoot
+}
 $scriptPath = Join-Path $root 'RoaringMic.ps1'
 $launcherPath = Join-Path $root 'RoaringMic-hidden.vbs'
 
@@ -58,9 +61,13 @@ Assert-True (-not [WaveRouter]::IsAcceptedPacket($oversized, '192.168.50.123')) 
 Assert-True ([WaveRouter]::GetRejectedPackets() -eq 3) 'packet rejection counter'
 
 Assert-True ($source -match '\$volBar\.Minimum\s*=\s*0;\s*\$volBar\.Maximum\s*=\s*200') 'volume slider 0-200 range'
-$mutex = [regex]::Match($source, '(?ms)^if \(-not \$script:MtxOwned\) \{(?<body>.*?)^\}')
-Assert-True ($mutex.Success -and $mutex.Groups['body'].Value -match 'exit 0') 'duplicate receiver exits cleanly'
-Assert-True ($mutex.Groups['body'].Value -notmatch 'MessageBox') 'duplicate receiver has no modal dialog'
+$mutexStart = $source.IndexOf('if (-not $script:MtxOwned)')
+$appDirStart = $source.IndexOf('$AppDir', $mutexStart)
+$mutexBody = if ($mutexStart -ge 0 -and $appDirStart -gt $mutexStart) {
+    $source.Substring($mutexStart, $appDirStart - $mutexStart)
+} else { '' }
+Assert-True ($mutexBody -match 'exit 0') 'duplicate receiver exits cleanly'
+Assert-True ($mutexBody -notmatch 'MessageBox') 'duplicate receiver has no modal dialog'
 
 $launcherSource = Get-Content -LiteralPath $launcherPath -Raw
 $vb = [regex]::Replace($launcherSource, '(?m)^command\s*=.*$', 'command = "cmd.exe /c exit 0"')
