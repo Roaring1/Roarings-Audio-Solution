@@ -16,7 +16,6 @@ import datetime, os, pathlib, socket, subprocess, sys
 
 PORT    = 46002
 HOME    = pathlib.Path.home()
-STATE   = HOME / '.config' / 'roaring' / 'mic_source'
 ALLOWED = os.environ.get('CMD_ALLOWED_IP', '192.168.50.132')
 MICCONF = HOME / '.config/hearth/roaring_mic_router.conf'
 
@@ -30,10 +29,8 @@ def log(msg: str):
 
 
 def current_source() -> str:
-    try:
-        return STATE.read_text().strip()
-    except FileNotFoundError:
-        return 'b1_mic'
+    """The sender is pinned to B1; legacy mic_source files are not authoritative."""
+    return 'b1_mic'
 
 
 def allowed_peer(addr) -> bool:
