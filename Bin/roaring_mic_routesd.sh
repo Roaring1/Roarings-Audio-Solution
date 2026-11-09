@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 9/20/2026-1  carla links are enforced here too
+# Summary: CARLA_TO_B1 / CARLA_TO_B2 from the conf are now applied every pass, so
+#          Hearth's IN chooser sticks instead of being undone by Carla's patchbay.
+#          Adds one `pw-link -l` per 3s to the existing three pactl lists.
 # 9/1/2026-1  fix:pactl-storm-1
 # Summary: Ensures sm7b_mono/astro_mic_48k sources and B1/B2 loopbacks exist.
 #          FIX: ONE sinks + ONE sources + ONE modules list per 3s (was ~15 pactl/s).
@@ -11,7 +15,7 @@ set -euo pipefail
 #          was fighting the feature. PipeWire does not auto-create these links,
 #          so the guard was unnecessary.
 
-CONF="$HOME/.config/roaring_mic_router.conf"
+CONF="$HOME/.config/hearth/roaring_mic_router.conf"
 LOG="$HOME/.cache/roaring-mic-routesd.log"
 mkdir -p "$HOME/.cache"
 exec >>"$LOG" 2>&1
@@ -31,6 +35,8 @@ wait_for_pactl() {
 load_conf() {
     B1_ROUTE="astro"
     B2_ROUTE="none"
+    CARLA_TO_B1="false"
+    CARLA_TO_B2="false"
     LATENCY_MSEC="10"
     RATE="48000"
     # runtime-provided conf path; contents are trusted operator config (SC1090).
@@ -42,12 +48,16 @@ load_conf() {
 _sinks_cache=""
 _sources_cache=""
 _modules_cache=""
+_links_cache=""
 
 refresh_all() {
     # THREE pactl calls total per iteration, not 15
     _sinks_cache="$(pactl list short sinks 2>/dev/null)"
     _sources_cache="$(pactl list short sources 2>/dev/null)"
     _modules_cache="$(pactl list short modules 2>/dev/null)"
+    # Fourth call: the graph itself. Carla is wired with pw-link, not with
+    # pulse modules, so it is invisible to the three lists above.
+    _links_cache="$(pw-link -l 2>/dev/null)"
 }
 
 sink_in_cache()   { printf '%s\n' "$_sinks_cache"   | awk '{print $2}' | grep -qx "$1"; }
@@ -154,6 +164,68 @@ dedupe_loopbacks_for_pair() {
     fi
 }
 
+# -- Carla links --------------------------------------------------------------
+# Carla feeds the mic buses through the PipeWire graph directly. Its own patchbay
+# restores those links on every Carla restart, so applying CARLA_TO_B* once is not
+# enough: Hearth would untick "SM7B via Carla", the link would come straight back,
+# and the IN chooser would look like it did nothing. The conf is the authority and
+# this loop is what makes that true.
+CARLA_OUT_L="Carla:audio-out1"
+CARLA_OUT_R="Carla:audio-out2"
+
+carla_present() {
+    # pw-link -l lists graph connections and omits unconnected ports. Carla's
+    # outputs must still count as present before this daemon has linked them.
+    local ports=""
+    ports="$(pw-cli ls Port 2>/dev/null)" || return 1
+    grep -Fq 'port.alias = "Carla:audio-out1"' <<< "$ports" &&
+        grep -Fq 'port.alias = "Carla:audio-out2"' <<< "$ports"
+}
+
+# pw-link -l prints each port on its own unindented line with that port's
+# connections indented beneath it.
+carla_link_exists() {
+    local port="$1" peer="$2"
+    printf '%s\n' "$_links_cache" | awk -v p="$port" -v q="$peer" '
+        /^[^[:space:]]/ { cur = $0; next }
+        cur == p && index($0, q) { found = 1 }
+        END { exit !found }
+    '
+}
+
+enforce_carla_bus() {
+    local bus="$1" want="$2" touched=0
+    local pairs="${CARLA_OUT_L}|${bus}:playback_FL ${CARLA_OUT_R}|${bus}:playback_FR"
+    local pair out dest
+    for pair in $pairs; do
+        out="${pair%%|*}"
+        dest="${pair##*|}"
+        if [[ "$want" == "true" ]]; then
+            if ! carla_link_exists "$out" "$dest"; then
+                pw-link "$out" "$dest" >/dev/null 2>&1 && touched=1
+            fi
+        else
+            if carla_link_exists "$out" "$dest"; then
+                pw-link -d "$out" "$dest" >/dev/null 2>&1 && touched=1
+            fi
+        fi
+    done
+    if (( touched )); then
+        log "carla -> $bus set to $want"
+    fi
+}
+
+enforce_carla() {
+    carla_present || return 0
+    local want_b1="${CARLA_TO_B1:-false}" want_b2="${CARLA_TO_B2:-false}"
+    # An inactive bus must be disconnected even if its saved Carla preference
+    # remains enabled; B1_ACTIVE/B2_ACTIVE are the top-level bus authority.
+    [[ "${B1_ACTIVE:-true}" == "true" ]] || want_b1=false
+    [[ "${B2_ACTIVE:-true}" == "true" ]] || want_b2=false
+    enforce_carla_bus mic_b1 "$want_b1"
+    enforce_carla_bus mic_b2 "$want_b2"
+}
+
 ensure_routes_exact() {
     load_conf
     local b1_active="${B1_ACTIVE:-true}"
@@ -206,6 +278,8 @@ ensure_routes_exact() {
     else
         unload_loopbacks_for_pair astro_mic_48k mic_b2 && changed=1
     fi
+
+    enforce_carla
 
     # Only refresh module cache if something changed
     (( changed )) && _modules_cache="$(pactl list short modules 2>/dev/null)" || true
