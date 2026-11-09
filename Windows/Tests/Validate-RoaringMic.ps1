@@ -10,6 +10,7 @@ $scriptPath = if (Test-Path -LiteralPath $candidatePath) {
     Join-Path $root 'RoaringMic.ps1'
 }
 $launcherPath = Join-Path $root 'RoaringMic-hidden.vbs'
+$installerPath = Join-Path $root 'Install-RoaringMicTask.ps1'
 
 function Assert-True([bool]$condition, [string]$name) {
     if (-not $condition) { throw "FAIL: $name" }
@@ -69,6 +70,22 @@ Assert-True ($source -match '\$volBar\.Minimum\s*=\s*0;\s*\$volBar\.Maximum\s*=\
 Assert-True ($source.Contains('if (-not $script:MtxOwned)')) 'duplicate-instance mutex guard present'
 Assert-True ($source.Contains('exit 0')) 'duplicate receiver exits cleanly'
 Assert-True (-not $source.Contains("MessageBox.Show('RoaringMic is already running'")) 'duplicate receiver has no modal dialog'
+
+$installTokens = $null
+$installErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile(
+    $installerPath, [ref]$installTokens, [ref]$installErrors
+) | Out-Null
+Assert-True ($installErrors.Count -eq 0) 'task installer PowerShell parser'
+$installer = Get-Content -LiteralPath $installerPath -Raw
+Assert-True ($installer.Contains('-DontStopOnIdleEnd')) 'task idle-stop disabled'
+Assert-True ($installer.Contains('-ExecutionTimeLimit ([TimeSpan]::Zero)')) 'task execution limit disabled'
+Assert-True ($installer.Contains('-RestartCount 3')) 'task recovery restart policy'
+Assert-True ($installer.Contains('-MultipleInstances IgnoreNew')) 'duplicate task starts ignored'
+Assert-True ($installer.Contains('Export-ScheduledTask')) 'prior task definition backed up'
+Assert-True ($installer.Contains("-LogonType Interactive")) 'task launches in interactive session'
+Assert-True ($installer.Contains('$registered.Principal.LogonType')) 'task principal verified through ScheduledTask object'
+Assert-True ($installer.Contains('[System.Xml.XmlConvert]::ToTimeSpan')) 'task time limit verified from XML duration'
 
 $launcherSource = Get-Content -LiteralPath $launcherPath -Raw
 $vb = [regex]::Replace($launcherSource, '(?m)^command\s*=.*$', 'command = "cmd.exe /c exit 0"')
