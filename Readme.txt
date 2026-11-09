@@ -87,6 +87,22 @@ The Windows validation checks PowerShell parsing, embedded C# compilation,
 0/100/200% PCM gain and saturation, UDP packet filtering, duplicate-instance
 behavior, and the Windows Script Host launcher using a harmless command stub.
 
+Windows Task Scheduler
+----------------------
+
+Copy `Windows/RoaringMic.ps1`, `Windows/RoaringMic-hidden.vbs`, and
+`Windows/Install-RoaringMicTask.ps1` into `%LOCALAPPDATA%\RoaringMic`.
+From the same interactive Windows account, run an elevated PowerShell window:
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+      "$env:LOCALAPPDATA\RoaringMic\Install-RoaringMicTask.ps1"
+
+The installer backs up an existing task definition to a timestamped XML file,
+registers an AtLogOn task in the interactive session, disables idle-stop and
+execution-time limits, and configures three one-minute recovery retries. It
+leaves a currently running receiver instance alone. Unless `-NoStart` is used,
+it verifies that the expected RoaringMic process owns UDP port 46001.
+
 This repository is a personal configuration snapshot. Hardware names,
 network addresses, installed device drivers, and user service paths may need
 adjustment on another machine.
