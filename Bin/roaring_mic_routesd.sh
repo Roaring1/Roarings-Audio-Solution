@@ -17,8 +17,17 @@ set -euo pipefail
 
 CONF="$HOME/.config/hearth/roaring_mic_router.conf"
 LOG="$HOME/.cache/roaring-mic-routesd.log"
-mkdir -p "$HOME/.cache"
-exec >>"$LOG" 2>&1
+# Unit tests source the real enforcement functions with mocked PipeWire tools.
+# The test mode is honored only when sourced, never when systemd executes this
+# file as the daemon. Production keeps its normal log sink and main loop.
+ROUTER_TEST_MODE=false
+if [[ "${ROARING_MIC_ROUTERD_TEST_MODE:-0}" == "1" && "${BASH_SOURCE[0]}" != "$0" ]]; then
+    ROUTER_TEST_MODE=true
+fi
+if [[ "$ROUTER_TEST_MODE" != "true" ]]; then
+    mkdir -p "$HOME/.cache"
+    exec >>"$LOG" 2>&1
+fi
 
 log() { echo "[mic-routesd] $(date +%H:%M:%S) $*"; }
 DEDUP_INTERVAL_SEC=30  # was 15 — dedup less often
@@ -295,4 +304,6 @@ main() {
     done
 }
 
-main
+if [[ "$ROUTER_TEST_MODE" != "true" ]]; then
+    main
+fi
