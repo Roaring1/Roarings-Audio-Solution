@@ -182,6 +182,10 @@ watch_pipewire_xruns() {
   done
 }
 
+cap_capture_fragment() {
+  cap_capture_fragment
+}
+
 select_capture_fragment() {
   local quantum=""
   if [[ -n "$PULSE_FRAGMENT_OVERRIDE" ]]; then
@@ -355,6 +359,7 @@ stream_mic() {
         if [[ $glitches -ge $GLITCH_LIMIT ]]; then
           if [[ -z "$PULSE_FRAGMENT_OVERRIDE" ]] && (( PULSE_FRAGMENT_BYTES < PULSE_FRAGMENT_MAX )); then
             PULSE_FRAGMENT_BYTES=$(( PULSE_FRAGMENT_BYTES * 2 ))
+            cap_capture_fragment
             (( PULSE_FRAGMENT_BYTES > PULSE_FRAGMENT_MAX )) && PULSE_FRAGMENT_BYTES="$PULSE_FRAGMENT_MAX"
             PULSE_FRAGMENT_FALLBACK=1
             log "glitch burst: increasing capture fragment to $PULSE_FRAGMENT_BYTES bytes for the next session"
