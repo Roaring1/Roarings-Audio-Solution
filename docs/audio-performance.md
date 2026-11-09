@@ -15,20 +15,20 @@ Keep this path intact while evaluating replacements. The sound-processing chain 
 
 ## Measured operating profile
 
-The previously validated low-latency profile was 48 kHz with a 512-frame PipeWire graph quantum. That is a historical test result, not the current persisted production profile:
+The production path is 48 kHz. The live graph is currently at 512 frames, with the automatic XRUN recovery floor also persisted as 512:
 
 - The Scarlett capture node negotiates a 128-frame ALSA period (2.67 ms).
 - A 512-frame graph cycle is 10.67 ms; one mono s16le datagram aligned to that cycle is 1,024 bytes.
 - A 256-frame graph (5.33 ms) was exercised but produced additional Scarlett xruns under normal machine load. The 512-frame setting was the lowest profile that passed the earlier short stability checks.
-- **Current live-state audit (2026-11-09):** PipeWire's default `clock.quantum` metadata is 1,024, but `clock.force-quantum=512`; `pw-top` confirms the active Scarlett and Carla driver rows are at 512 frames / 48 kHz. The persisted learned safe-quantum file contains `1024`, so the next supervised Carla restart will reapply that conservative floor. The current graph is still 512 frames until that restart. A 32-second 1,024-byte-fragment trial did not increase Scarlett ERR (7), Carla ERR (0), or B1 ERR (1).
+- **Current live-state audit (2026-11-09):** PipeWire's default `clock.quantum` metadata is 1,024, but `clock.force-quantum=512`; `pw-top` confirms the active Scarlett driver row is at 512 frames / 48 kHz. The persisted learned safe-quantum file is now `512`. The prior recovery to 1,024 frames was temporary; subsequent clean stability allowed the monitor to return to 512. Scarlett's current ERR count is 8, and it remained flat during the latest checks.
 - Carla's plugin processing load was previously small relative to a graph cycle, and the saved rack reports roughly 5.42 ms plugin latency. Keep the DSP rack unchanged while transport experiments run.
 - The live Windows WaveOut receiver has learned a high safety floor after real underruns. It remains the production fallback until the WASAPI candidate passes an on-device comparison.
 
-The previous 2,048-byte capture block was being split by FFmpeg's `pkt_size=1316` UDP muxer into 1,316-byte and 732-byte datagrams. The Windows receiver consequently saw alternating packet sizes and near-back-to-back arrivals, which inflated its learned safety floor. The deployed sender now caps Pulse fragments at 1,024 bytes. A local loopback A/B measured one 1,024-byte datagram every 10.67 ms (p95 10.90 ms), while the 2,048-byte block produced the 1,316+732 split and 21.48 ms p95 inter-packet gaps. A live `tcpdump` on the PC-to-laptop interface confirmed consecutive 1,024-byte datagrams at 10.6-10.8 ms intervals. This uses the currently active 512-frame graph without changing the Carla rack or persisted safety floor.
+The previous 2,048-byte Pulse capture block was split by FFmpeg's UDP muxer into 1,316-byte and 732-byte datagrams. The current sender keeps the Pulse input fragment graph-aware, then applies `asetnsamples=n=512:p=0,arealtime` before UDP output. This produces fixed 1,024-byte network packets, paced at about 10.67 ms, including when a future 1,024-frame graph delivers two 512-sample frames together. The production sender was restarted with this filter; a live `tcpdump` on port 46001 showed 18 consecutive 1,024-byte datagrams at 10.6-10.8 ms intervals. The latest active graph is 512 frames, so the Pulse input fragment is currently 1,024 bytes; the 2,048-byte input ceiling is reserved for the 1,024-frame graph case. No 2,048-byte UDP datagram is sent.
 
-The Windows VB-CABLE control panel reports a fixed 48 kHz rate and a 7,168-sample maximum allocation. A trial at 1,536 samples (three 512-sample packets / 32 ms) was rolled back after the production WaveOut receiver's learned floor rose from four to five packets and its underrun/drop counters increased from 2/3 to 3/7 while an additional CABLE Output capture reader was active. The known-good 3,072-sample setting (six packets / 64 ms) has been restored and visually confirmed. The extra capture reader has been stopped. Keep the 7,168 maximum unchanged. Do not retry 1,536 until the Rust WASAPI path can be tested independently and the cable's pull-loss rate is measured without degrading the production receiver.
+The Windows VB-CABLE control panel reports a fixed 48 kHz rate and a 7,168-sample maximum allocation. A trial at 1,536 samples (three 512-sample packets / 32 ms) was rolled back after the production WaveOut receiver's counters increased during concurrent testing. The 3,072-sample setting (six packets / 64 ms) has been restored and visually confirmed; the maximum remains 7,168. The extra capture reader has been stopped. Keep 3,072 until an isolated capture-quality test can establish that a smaller VB-CABLE buffer is stable without disrupting the production receiver.
 
-The live WaveOut receiver matched the new 1,024-byte profile and lowered its learned floor from 8 to 4 after two real startup underruns at the attempted two-packet floor. Its arrival-jitter EWMA dropped from about 13.4 ms to about 0.1-0.2 ms, and subsequent health snapshots showed no new underrun/drop increments. The WaveOut completion/queue remains roughly 68-74 ms (about 64-75 ms queued), so the WASAPI candidate remains the likely path to lower Windows rendering latency.
+The live WaveOut receiver matched the new 1,024-byte profile and reduced its arrival-jitter EWMA from about 13.4 ms to about 0.1-0.2 ms. A later 1,536-sample VB-CABLE trial caused underrun/drop growth and was rolled back to 3,072 samples. The receiver's current learned floor is eight packets, with 9 underruns and 34 drops total; those counters have remained unchanged across several subsequent health snapshots. Arrival stays near 10.5-10.7 ms with jitter around 0.1 ms, but the WaveOut queue remains about 64-75 ms and completion about 70-75 ms. Do not lower the learned floor on the production stream. The Rust WASAPI candidate is still under test.
 
 
 
@@ -40,7 +40,7 @@ The graph period is not the whole end-to-end delay. Carla reports 260 samples of
 
 The LSP manual states that the limiter's lookahead buffer is added to output latency: https://lsp-plug.in/?page=manuals&section=limiter_mono. Do not lower it just to make the number smaller. A shorter lookahead can reduce the limiter's ability to catch fast peaks. The next useful experiment is an A/B using the same recorded loud speech/transient sample, first comparing the current 0.5/5 ms gate/limiter settings with a conservative 0.25/2 ms candidate. Record true peaks, clipping, loudness, and blind-listening quality. Do this on a copy of the Carla project or an isolated test graph; leave the live preset unchanged until the candidate passes.
 
-The Windows receiver deliberately holds two packets initially to preserve quality. That queue and the plugin lookahead should be measured separately before reducing their safety margin.
+The production WaveOut receiver currently uses its learned eight-packet floor. The Rust candidate starts at two packets only after its own receive queue is proven healthy. Do not conflate the two queue policies or lower the production floor to match the candidate.
 
 ## Carla: one engine, not two
 
@@ -99,7 +99,7 @@ The objective is lower observed end-to-end latency while retaining quality, not 
 
 ## Rust WASAPI receiver candidate (not production)
 
-A separate Windows-only Rust executable is being developed under `crates/roaring-mic-windows`. The source now contains a silent-by-default UDP-to-WASAPI bridge; the new bridge has passed Linux-side Windows-target type-check and strict Clippy but still needs a fresh native Windows CI build and live silent-UDP test. It preserves the current 48 kHz mono S16LE UDP protocol and uses:
+A separate Windows-only Rust executable is being developed under `crates/roaring-mic-windows`. The source now contains a silent-by-default UDP-to-WASAPI bridge and an independent UDP ingress probe. Both have passed Linux-side Windows-target type-check and strict Clippy; the new code still needs a fresh native Windows CI build and on-device packet-ingress test. It preserves the current 48 kHz mono S16LE UDP protocol and uses:
 
 - `wasapi` for IAudioClient3 event-driven shared-mode rendering.
 - `rtrb` for a bounded single-producer/single-consumer sample ring.
@@ -109,6 +109,7 @@ A separate Windows-only Rust executable is being developed under `crates/roaring
 - A two-packet startup floor, automatic re-priming after actual output underruns, and one-packet safe-floor growth at most every five seconds.
 - Exact sender-IP filtering and packet-size locking for each session. Variable-size 1,316+732 split datagrams are rejected instead of corrupting packet-duration estimates.
 - `--udp --silent` consumes real UDP data and drives the WASAPI event loop but outputs silence. Actual microphone rendering requires an explicit `--render` argument. This permits a parallel test while the existing microphone signal remains the only audible stream.
+- `--udp-probe` tests the exact Rust UDP socket and PCM parser without initializing WASAPI, and reports accepted/rejected packet counts and packet-size consistency. Use it to separate network-ingress failures from device/render failures.
 
 ### Windows endpoint measurements
 
@@ -121,7 +122,7 @@ The Windows laptop reports these IAudioClient3 shared-mode capabilities at 48 kH
 
 A WASAPI event-driven capability test on CABLE Input at 128 frames reported a 280-frame engine buffer (5.83 ms), with roughly 2.02 ms median and 2.66 ms p95 event wake intervals. An earlier isolated C# UDP-to-WASAPI probe received 2,816 packets in 30 seconds with no wrong-source packets, queue drops, event timeouts, or underrun frames using a two-packet prebuffer. A one-packet run received the same packet count but recorded one 128-frame output underrun. A 256-frame run also had zero underruns, but its engine buffer was 562 frames (11.71 ms). These were silent-output tests; they did not duplicate the live microphone into the cable. They validate the endpoint and transport, not the Rust receiver currently being built.
 
-The Rust candidate is configured for 128-frame shared-mode rendering and a two-packet floor. One packet is not the default. The Rust source now implements the UDP bridge, but its native MSVC build and on-device silent-UDP test must pass after the latest bridge commit. The C# probe results above are reference measurements only. None of these tests is an acoustic end-to-end latency measurement. The candidate has not replaced WaveOut and must not be installed as the automatic receiver until native Windows CI, sustained silent testing, a controlled real-audio handover, and rollback all pass.
+The Rust candidate is configured for 128-frame shared-mode rendering and a two-packet floor. One packet is not the default. The Rust source now implements the UDP bridge, but its native MSVC build and on-device silent-UDP test must pass after the latest bridge commit. The C# probe results above are reference measurements only. None of these tests is an acoustic end-to-end latency measurement. The candidate has not replaced WaveOut. A recent on-device run bound port 46003 but failed its five-second startup queue gate with no accepted samples, even though a separate .NET diagnostic listener received 40 valid 1,024-byte packets from the PC on the same port. A standalone Rust `--udp-probe` has now been added to isolate the socket/parser from WASAPI and provide packet acceptance diagnostics. Do not install or hand over the Rust candidate until that ingress test passes, followed by sustained silent testing, controlled real-audio handover, and rollback.
 
 ### Build checks
 

@@ -434,6 +434,91 @@ fn make_udp_socket(listen: SocketAddr) -> Result<UdpSocket, Box<dyn Error>> {
     Ok(socket)
 }
 
+fn udp_ingress_probe(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut listen: SocketAddr = DEFAULT_LISTEN.parse()?;
+    let mut peer: IpAddr = DEFAULT_PEER.parse()?;
+    let mut duration = Duration::from_secs(10);
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--listen=") {
+            listen = value.parse()?;
+        } else if let Some(value) = arg.strip_prefix("--peer=") {
+            peer = value.parse()?;
+        } else if let Some(value) = arg.strip_prefix("--seconds=") {
+            duration = Duration::from_secs(value.parse()?);
+        } else if arg != "--udp-probe" {
+            return Err(format!("unknown UDP probe argument: {arg}").into());
+        }
+    }
+
+    let socket = make_udp_socket(listen)?;
+    println!(
+        "UDP_PROBE_STARTED listen={listen} expected_peer={peer} duration_ms={}",
+        duration.as_millis()
+    );
+
+    let mut datagram = [0_u8; MAX_PCM_DATAGRAM_BYTES + 1];
+    let mut received = 0_u64;
+    let mut accepted = 0_u64;
+    let mut rejected_sources = 0_u64;
+    let mut rejected_packets = 0_u64;
+    let mut packet_size_changes = 0_u64;
+    let mut expected_packet_bytes = 0_usize;
+    let mut first_source = None;
+    let mut last_arrival = None;
+    let mut max_arrival_us = 0_u64;
+    let mut size_counts = std::collections::BTreeMap::<usize, u64>::new();
+    let started = Instant::now();
+
+    while started.elapsed() < duration {
+        let (length, source) = match socket.recv_from(&mut datagram) {
+            Ok(result) => result,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(error) => return Err(Box::new(error)),
+        };
+        received += 1;
+        first_source.get_or_insert(source);
+        if source.ip() != peer {
+            rejected_sources += 1;
+            continue;
+        }
+        let packet = match RawPcmPacket::parse(&datagram[..length]) {
+            Ok(packet) => packet,
+            Err(_) => {
+                rejected_packets += 1;
+                continue;
+            }
+        };
+        if expected_packet_bytes == 0 {
+            expected_packet_bytes = length;
+        } else if expected_packet_bytes != length {
+            packet_size_changes += 1;
+            rejected_packets += 1;
+            continue;
+        }
+        *size_counts.entry(length).or_insert(0) += 1;
+        let now = Instant::now();
+        if let Some(previous) = last_arrival.replace(now) {
+            max_arrival_us = max_arrival_us.max(now.duration_since(previous).as_micros() as u64);
+        }
+        accepted += 1;
+        std::hint::black_box(packet.frames());
+    }
+
+    println!(
+        "UDP_PROBE_RESULT received={received} accepted={accepted} rejected_sources={rejected_sources} rejected_packets={rejected_packets} packet_size_changes={packet_size_changes} first_source={} packet_sizes={:?} max_arrival_ms={:.3} elapsed_ms={}",
+        first_source.map(|source| source.to_string()).unwrap_or_else(|| "none".to_owned()),
+        size_counts,
+        max_arrival_us as f64 / 1_000.0,
+        started.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 fn spawn_udp_worker(
     socket: UdpSocket,
     expected_peer: IpAddr,
@@ -611,8 +696,18 @@ fn run_udp(config: Config) -> Result<(), Box<dyn Error>> {
     }
     if packet_samples == 0 || consumer.slots() < target_samples {
         return Err(format!(
-            "startup queue timed out: have {} samples, need {target_samples}",
-            consumer.slots()
+            "startup queue timed out: have={} need={} last_packet_samples={} packets={} samples={} rejected_sources={} rejected_packets={} packet_size_changes={} queue_dropped={} listen={} peer={} ",
+            consumer.slots(),
+            target_samples,
+            metrics.last_packet_samples.load(Ordering::Relaxed),
+            metrics.received_packets.load(Ordering::Relaxed),
+            metrics.received_samples.load(Ordering::Relaxed),
+            metrics.rejected_sources.load(Ordering::Relaxed),
+            metrics.rejected_packets.load(Ordering::Relaxed),
+            metrics.packet_size_changes.load(Ordering::Relaxed),
+            metrics.queue_dropped_packets.load(Ordering::Relaxed),
+            config.listen,
+            config.peer
         )
         .into());
     }
@@ -791,6 +886,7 @@ fn print_help() {
     println!(
         "RoaringMic Windows candidate\n\
          --probe                   Query endpoint capabilities only\n\
+         --udp-probe               Test UDP socket/PCM parsing without WASAPI\n\
          --silent-render-probe     Render silence through WASAPI (no UDP input)\n\
          --udp --silent            Receive UDP and render silence (safe parallel mode)\n\
          --render                  Explicitly allow microphone audio to reach the device\n\
@@ -814,6 +910,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let _com = ComApartment::initialize()?;
     let needle =
         std::env::var("ROARING_MIC_DEVICE").unwrap_or_else(|_| DEFAULT_DEVICE_NEEDLE.to_owned());
+    if args.iter().any(|arg| arg == "--udp-probe") {
+        return udp_ingress_probe(&args);
+    }
     if args.iter().any(|arg| arg == "--probe") {
         return probe_device(&needle);
     }

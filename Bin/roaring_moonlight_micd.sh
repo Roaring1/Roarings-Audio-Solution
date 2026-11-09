@@ -20,14 +20,14 @@ MIC_SOURCE="${MIC_SOURCE:-b1_mic}"
 MIC_PORT="${MIC_PORT:-46001}"
 RATE=48000
 CHANNELS=1
-# Pulse fragments are mono s16le bytes. The UDP muxer is capped at 1316 bytes;
-# keep each audio datagram at 1024 bytes so one Pulse fragment remains one UDP
-# datagram. A 2048-byte graph-aligned fragment is split into 1316+732 bytes,
-# creating uneven packet cadence and corrupting the receiver's per-packet jitter model.
+# Pulse capture fragments are mono s16le bytes and may span one 1024-frame
+# graph cycle (2048 bytes). The filter chain below splits them into 512-sample
+# frames and paces by PTS. Each resulting UDP datagram is always 1024 bytes;
+# do not confuse the larger Pulse capture fragment with the network packet size.
 PULSE_FRAGMENT_OVERRIDE="${PULSE_FRAGMENT_BYTES:-}"
 PULSE_FRAGMENT_BYTES=960
 PULSE_FRAGMENT_FALLBACK=0
-PULSE_FRAGMENT_MAX=1024
+PULSE_FRAGMENT_MAX=2048
 # Learned minimum stable graph period for this machine. Set
 # ROARING_MIC_MIN_QUANTUM=256 only to opt into further 5.33 ms trials.
 MIN_SAFE_QUANTUM="$(printenv ROARING_MIC_MIN_QUANTUM 2>/dev/null || echo 512)"
@@ -183,7 +183,10 @@ watch_pipewire_xruns() {
 }
 
 cap_capture_fragment() {
-  cap_capture_fragment
+  if (( PULSE_FRAGMENT_BYTES > PULSE_FRAGMENT_MAX )); then
+    log "capping Pulse capture fragment $PULSE_FRAGMENT_BYTES bytes to $PULSE_FRAGMENT_MAX bytes"
+    PULSE_FRAGMENT_BYTES="$PULSE_FRAGMENT_MAX"
+  fi
 }
 
 select_capture_fragment() {
@@ -208,9 +211,8 @@ select_capture_fragment() {
   if [[ -z "$PULSE_FRAGMENT_OVERRIDE" && $PULSE_FRAGMENT_FALLBACK -eq 0 ]]; then
     if [[ "$quantum" =~ ^[0-9]+$ ]]; then
       if (( quantum <= 2048 )); then
-        # Start from a graph-aware duration, then cap at one MTU-safe 1024-byte
-        # PCM datagram. At a 1024-frame graph this yields two consistent
-        # 512-frame packets rather than an oversized block split by UDP pkt_size.
+        # Capture one graph-aware input block. The filter chain splits it into
+        # 512-sample PCM frames and paces each frame by PTS before UDP output.
         PULSE_FRAGMENT_BYTES=$(( quantum * 2 ))
         if (( PULSE_FRAGMENT_BYTES < 480 )); then
           PULSE_FRAGMENT_BYTES=480
@@ -227,7 +229,7 @@ select_capture_fragment() {
   fi
 
   if (( PULSE_FRAGMENT_BYTES > PULSE_FRAGMENT_MAX )); then
-    log "capping Pulse fragment $PULSE_FRAGMENT_BYTES bytes to MTU-safe $PULSE_FRAGMENT_MAX-byte UDP payload"
+    log "capping Pulse capture fragment $PULSE_FRAGMENT_BYTES bytes to supported $PULSE_FRAGMENT_MAX-byte input block"
     PULSE_FRAGMENT_BYTES="$PULSE_FRAGMENT_MAX"
   fi
 
@@ -310,7 +312,10 @@ stream_mic() {
   # Windows side decodes with ffmpeg → VB-Audio Cable Input (see receive_mic.bat).
   # NOTE: -use_wallclock_as_timestamps was removed — it substitutes jittery wall-clock
   # times for PulseAudio timestamps, causing non-monotonic DTS spam that corrupts
-  # the UDP stream on the receiver side.  aresample=async=1 handles clock drift.
+  # the UDP stream on the receiver side. aresample corrects clock drift; asetnsamples
+  # frames exactly 512 mono samples per datagram, and arealtime paces those frames
+  # against their PTS. At a 1024-frame PipeWire graph, this avoids emitting two
+  # 1024-byte UDP datagrams back-to-back every 21.33 ms.
   #
   # MEMORY: when the source suspends/resumes, PulseAudio's PTS jumps by the
   # whole idle gap and libswresample tries to bridge it with silence. It logs
@@ -336,7 +341,7 @@ stream_mic() {
     -channels "$CHANNELS" \
     -fragment_size "$PULSE_FRAGMENT_BYTES" \
     -i "$MIC_SOURCE" \
-    -af aresample=async=1:min_hard_comp=0.1 \
+    -af aresample=async=1:min_hard_comp=0.1,asetnsamples=n=512:p=0,arealtime \
     -ar "$RATE" \
     -ac "$CHANNELS" \
     -f s16le \

@@ -120,9 +120,12 @@ enforce_carla
 
     def test_sender_defaults_to_b1_and_uses_private_fifo_directory(self):
         source = (ROOT / "Bin/roaring_moonlight_micd.sh").read_text()
-        self.assertIn("PULSE_FRAGMENT_MAX=1024", source)
+        self.assertIn("PULSE_FRAGMENT_MAX=2048", source)
         self.assertIn("pkt_size=1316", source)
-        self.assertIn("creating uneven packet cadence", source)
+        self.assertIn("asetnsamples=n=512:p=0,arealtime", source)
+        self.assertIn("asetnsamples", source)
+        self.assertIn("arealtime paces those frames", source)
+        self.assertIn("graph cycle (2048 bytes)", source)
         self.assertIn("MIC_SOURCE=", source)
         self.assertIn("b1_mic", source)
         self.assertIn("moonlight-micd.XXXXXX", source)
@@ -131,21 +134,39 @@ enforce_carla
         self.assertIn("wait_for_peer", source)
         self.assertIn("GLITCH_LIMIT", source)
 
+    def test_sender_glitch_fragment_cap_is_bounded_and_non_recursive(self):
+        script_path = ROOT / "Bin/roaring_moonlight_micd.sh"
+        shell = r"""set -euo pipefail
+PULSE_FRAGMENT_BYTES=4096
+PULSE_FRAGMENT_MAX=2048
+log() { :; }
+source <(sed -n '/^cap_capture_fragment() {/,/^}/p' "$SCRIPT_PATH")
+cap_capture_fragment
+printf '%s' "$PULSE_FRAGMENT_BYTES"
+"""
+        env = os.environ.copy()
+        env["SCRIPT_PATH"] = str(script_path)
+        result = subprocess.run(
+            ["bash", "-c", shell], capture_output=True, text=True, env=env, check=False
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "2048")
+
     def test_sender_selects_graph_aware_capture_fragment(self):
         script_path = ROOT / "Bin/roaring_moonlight_micd.sh"
         cases = (
             ("128", "0", "", "0", "480"),
             ("256", "0", "", "0", "512"),
             ("512", "0", "", "0", "1024"),
-            ("1024", "0", "", "0", "1024"),
-            ("2048", "0", "", "0", "1024"),
+            ("1024", "0", "", "0", "2048"),
+            ("2048", "0", "", "0", "2048"),
             ("unknown", "0", "", "0", "960"),
             ("1024", "256", "", "0", "512"),
             ("1024", "512", "", "0", "1024"),
             ("1024", "0", "768", "0", "768"),
-            ("1024", "0", "241", "0", "1024"),
+            ("1024", "0", "241", "0", "2048"),
             ("1024", "0", "0480", "0", "480"),
-            ("256", "0", "", "1", "1024"),
+            ("256", "0", "", "1", "1920"),
         )
         for quantum, forced, override, fallback, expected in cases:
             with self.subTest(quantum=quantum, forced=forced, override=override, fallback=fallback):
@@ -162,7 +183,7 @@ RATE=48000
 PULSE_FRAGMENT_OVERRIDE="$TEST_OVERRIDE"
 PULSE_FRAGMENT_BYTES=1920
 PULSE_FRAGMENT_FALLBACK="$TEST_FALLBACK"
-PULSE_FRAGMENT_MAX=1024
+PULSE_FRAGMENT_MAX=2048
 log() { :; }
 pw-metadata() {
   if [[ "$TEST_QUANTUM" != unknown ]]; then
@@ -545,7 +566,7 @@ echo 'R 95 512 48000 600us 1us 0.06 0.00 3 S32LE 2 48000 alsa_input.usb-Focusrit
         self.assertIn("-channels \"$CHANNELS\"", source)
         self.assertIn("-fragment_size \"$PULSE_FRAGMENT_BYTES\"", source)
         self.assertIn("-fflags +nobuffer", source)
-        self.assertIn("PULSE_FRAGMENT_MAX=1024", source)
+        self.assertIn("PULSE_FRAGMENT_MAX=2048", source)
         self.assertIn("PULSE_FRAGMENT_FALLBACK=1", source)
         self.assertIn("ran >= 600", source)
 
