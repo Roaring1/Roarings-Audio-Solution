@@ -33,6 +33,47 @@ Assert-True $match.Success 'embedded WaveRouter C# block found'
 Add-Type -TypeDefinition $match.Groups[1].Value -ErrorAction Stop
 Write-Output 'PASS: embedded WaveRouter C# compile'
 
+# Prove a Stop issued before the worker reaches Run() cannot be undone by a
+# delayed worker start. The worker sleeps first, then calls the real Run().
+# This path exits at Run()'s initial Running guard and never opens waveOut.
+[WaveRouter]::Running = $true
+$lateWorker = [System.Management.Automation.PowerShell]::Create()
+[void]$lateWorker.AddScript('Start-Sleep -Milliseconds 200; [WaveRouter]::Run()')
+$lateHandle = $lateWorker.BeginInvoke()
+[WaveRouter]::Stop()
+try {
+    Assert-True ($lateHandle.AsyncWaitHandle.WaitOne(5000)) 'delayed receiver worker completes after stop'
+    $null = $lateWorker.EndInvoke($lateHandle)
+}
+finally {
+    $lateWorker.Dispose()
+}
+Assert-True (-not [WaveRouter]::Running) 'stop-before-worker-start stays stopped'
+
+# Exercise the real no-device failure path without opening or changing an
+# output device: an impossible device name must return before waveOutOpen.
+$deviceNeedleBefore = [WaveRouter]::DeviceNeedle
+try {
+    [WaveRouter]::DeviceNeedle = '__RoaringMic_Test_Device_Does_Not_Exist__'
+    [WaveRouter]::Running = $true
+    [WaveRouter]::Run()
+    Assert-True (-not [WaveRouter]::Running) 'missing output device clears Running'
+    Assert-True ([WaveRouter]::LastError -like 'Device * not found*') 'missing output device reports actionable error'
+}
+finally {
+    [WaveRouter]::DeviceNeedle = $deviceNeedleBefore
+    [WaveRouter]::Running = $false
+}
+
+# Packet freshness is time-bounded and must expire even when the last source IP
+# remains displayed in the tray.
+[WaveRouter]::LastPacketTicks = [DateTime]::UtcNow.Ticks
+Assert-True ([WaveRouter]::HasRecentPackets()) 'fresh packet timestamp is live'
+[WaveRouter]::LastPacketTicks = [DateTime]::UtcNow.AddSeconds(-3).Ticks
+Assert-True (-not [WaveRouter]::HasRecentPackets()) 'stale packet timestamp expires'
+[WaveRouter]::LastPacketTicks = 0
+Assert-True (-not [WaveRouter]::HasRecentPackets()) 'empty packet timestamp is not live'
+
 [WaveRouter]::ResetCounters()
 [WaveRouter]::PlaybackVolume = 0.0
 Assert-True ([WaveRouter]::ScalePcmSample([int16]32767) -eq 0) '0 percent gain'
