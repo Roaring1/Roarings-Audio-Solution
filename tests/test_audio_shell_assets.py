@@ -342,6 +342,7 @@ esac
                     **os.environ,
                     "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
                     "PW_METADATA_LOG": str(log),
+                    "HOME": temp_dir,
                 },
                 check=False,
             )

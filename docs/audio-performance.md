@@ -15,18 +15,19 @@ Keep this path intact while evaluating replacements. The sound-processing chain 
 
 ## Measured operating profile
 
-The current measured baseline is 48 kHz with a 512-frame PipeWire graph quantum:
+The previously validated low-latency profile was 48 kHz with a 512-frame PipeWire graph quantum. That is a historical test result, not the current persisted production profile:
 
-- 512 / 48000 = 10.67 ms per graph cycle.
 - The Scarlett capture node negotiates a 128-frame ALSA period (2.67 ms).
-- The Linux sender aligns one mono s16le datagram to one graph quantum (1,024 bytes / 10.67 ms at 512 frames).
-- Carla is in Continuous Rack mode, a single-client rack processing mode.
-- Carla used about 6-8% of the observed graph-cycle processing budget during the live checks.
-- The Scarlett capture-node ERR count did not increase during the latest 16-second steady-state window at 512 frames.
-- The Windows receiver's auto mode starts with two graph-aligned packets (about 21.3 ms at the 512-frame profile), the previously proven stable floor. It can temporarily grow to eight packets when a late gap requires it. Each actual WaveOut underrun raises the persistent per-peer/rate/packet-size floor by only one step, with a five-second guard, so one extreme scheduling pause cannot permanently pin the connection at eight. The active queue decays toward the learned floor after 60 seconds of stable arrivals; the learned floor relaxes one step only after ten clean wall-clock minutes. A changed peer/rate/packet-size profile starts again at two packets. The profile is saved by the always-running status timer, not by opening the tray flyout.
-- The Windows UDP receive socket is capped at 8 KiB to prevent seconds of stale queued audio after a scheduling stall.
+- A 512-frame graph cycle is 10.67 ms; one mono s16le datagram aligned to that cycle is 1,024 bytes.
+- A 256-frame graph (5.33 ms) was exercised but produced additional Scarlett xruns under normal machine load. The 512-frame setting was the lowest profile that passed the earlier short stability checks.
+- **Current live-state audit (2026-11-09):** PipeWire reports `clock.force-quantum=512`, but its active `clock.quantum` is 1,024 frames. The persisted learned safe-quantum file contains `1024`, and the active FFmpeg sender requests a 2,048-byte fragment (1,024 mono S16 samples / 21.33 ms). The sender is therefore still honoring the learned 1,024-frame safe profile. Do not manually lower that learned value until a controlled trial proves the Scarlett capture-node XRUN counter remains unchanged under normal load.
+- Carla's plugin processing load was previously small relative to a graph cycle, and the saved rack reports roughly 5.42 ms plugin latency. Keep the DSP rack unchanged while transport experiments run.
+- The live Windows WaveOut receiver has learned a high safety floor after real underruns. It remains the production fallback until the WASAPI candidate passes an on-device comparison.
 
-A 256-frame graph (5.33 ms) was exercised, but it produced additional Scarlett xruns under the machine's normal load. The safe default is therefore 512 frames. ROARING_MIC_MIN_QUANTUM=256 is an explicit opt-in for further trials, not the default. A new xrun steps the graph up (256 -> 512 -> 1024); the sender's monitor retries lower settings only after a clean interval. Carla's session applies the 512-frame graph force after its JACK node appears, so a Carla restart does not silently restore the 1024-frame default.
+The current sender's 2,048-byte packet size adds about 21.33 ms of packet accumulation before transmission. This is an important next Linux-side optimization target, but the current 1,024-frame safe quantum must be respected until the capture graph is demonstrated stable at a lower size. The 512-frame profile remains a known historical candidate, not a claim about the graph currently running.
+
+The Windows VB-CABLE control panel was read with a real CABLE Output capture client attached. The driver is fixed at 48 kHz; its maximum allocation remains 7,168 samples. Its current-latency setting was stepped down from 7,168 to 6,144, then 3,072, then 1,536 samples in reversible trials. The 1,536-sample setting was visually confirmed, but a long-duration quality test at that value is still outstanding. Keep the maximum allocation unchanged and restore the prior value if the cable pull-loss or DMA F/H counters begin increasing. The Windows receiver itself is still WaveOut; changing the cable latency does not fix the measured WaveOut completion/queue behavior by itself.
+
 
 
 ### Graph-aligned packet sizing
@@ -49,19 +50,36 @@ Do not remove LV2 plugins just because their UI is absent. First profile each pl
 
 ## Where Rust fits
 
-The most promising replacement candidate is the Linux transport edge, not the Carla DSP rack or the Windows UI:
+Rust is the preferred language for the two transport edges because they are the parts that need bounded memory, deterministic queue ownership, low-copy packet handling, and explicit timing metrics. The shared `roaring-mic-core` crate keeps PCM parsing, gain, adaptive queue math, and packet/profile rules platform-independent. It does not own the Carla DSP rack or a UI framework.
 
-- A Rust JACK client can read the already-processed mic_b1 monitor ports directly through PipeWire's JACK compatibility layer.
-- Its real-time JACK callback should only copy a preallocated block of samples into a bounded single-producer/single-consumer ring buffer.
-- A separate non-real-time worker can downmix stereo to mono, convert to s16le, form the existing 10 ms datagrams, and send UDP to port 46001.
-- Ring-buffer overflow, UDP send errors, packet sequence gaps, and capture xrun counts must be explicit metrics.
-- The existing FFmpeg sender remains the fallback and A/B reference until the Rust path proves equal sound quality and lower measured latency.
+### Windows receiver candidate
 
-A temporary dependency-free Rust feasibility prototype was also built against the installed libpulse-simple runtime (not the JACK API). With a 960-byte / 10 ms capture request, it produced 401 packets in four seconds and a loopback receiver measured approximately 10.65 ms median / 10.85 ms p95 inter-arrival. The FFmpeg comparison was approximately 10.66 ms median / 10.86 ms p95. In short time samples, Rust consumed about 0.02 CPU-seconds versus FFmpeg about 0.19 CPU-seconds over four seconds. These are preliminary process/loopback measurements, not an end-to-end Windows result and not a proof of lower latency. A 480-byte / 5 ms Rust request doubled the datagram count but packets still arrived in pairs around the 10.7 ms graph cadence, so it did not improve the effective graph delivery interval. The temporary prototype was not added to production.
+The current production receiver remains the PowerShell host with its embedded C# WaveOut engine. It is the known-good rollback. The Rust candidate uses:
 
-Never call blocking network I/O, allocate memory, wait on a mutex, or perform filesystem/logging work inside the JACK process callback. The jack crate provides JACK process handlers and audio-port slices; use a preallocated SPSC ring such as rtrb to move audio to a normal worker thread. This machine currently has Rust installed but lacks JACK development headers and cached jack/rtrb crates, so a real build and load test require those build dependencies. No unbuildable Rust dependency is part of production.
+- `wasapi` and IAudioClient3 for event-driven shared-mode rendering. It does not take exclusive control of the audio endpoint.
+- `rtrb` for a bounded SPSC sample queue between a normal UDP thread and the render thread.
+- A 48 kHz stereo float WASAPI mix format, fed from the existing mono S16LE UDP wire format.
+- An exact sender-IP allow-list, strict datagram validation, MMCSS Pro Audio scheduling, and bounded event/queue/drop diagnostics.
+- Automatic re-priming with a one-step safe-floor increase after an actual output underrun. The initial floor is two packets; one packet is not the default.
 
-TypeScript is appropriate for a future configuration UI, diagnostics dashboard, or control surface. It is not the preferred audio callback or packet pump: garbage collection and runtime scheduling introduce jitter that is unnecessary in the real-time signal path.
+On the laptop, CABLE Input reports a 128-frame minimum shared period. The actual shared engine buffer at that request was 280 frames (5.83 ms). A parallel silent-output run received 2,816 packets in 30 seconds with no rejects, queue drops, event timeouts, or underrun frames at 128 frames/two packets. The one-packet run recorded one 128-frame underrun; the 256-frame/two-packet run was also clean but reported a 562-frame (11.71 ms) engine buffer. This is a measured pipeline result, not an acoustic end-to-end latency measurement. The Rust executable is not deployed and the WaveOut route remains active.
+
+The Windows build CI must compile the real MSVC binary and run the existing receiver tests before an artifact can be considered for laptop testing. The first laptop run should use `--silent` on an isolated UDP port while the WaveOut production receiver continues to provide the audible signal. Only after packet, queue, continuity, and long-duration tests pass should a controlled handover be attempted.
+
+### Linux capture candidate
+
+The Linux transport remains FFmpeg/PulseAudio-compatible capture because it is reliable and keeps the Scarlett/Carla path unchanged. A separate native PipeWire Rust feasibility prototype exists outside the repository at `/tmp/roaring-pw-rust-transport`. It uses the `pipewire` and `rtrb` crates, captures the already-processed B1 monitor node, downmixes float audio to mono S16LE, and sends the existing UDP datagrams from a non-real-time worker. The PipeWire callback only reads the mapped audio buffer and pushes samples into a bounded SPSC ring.
+
+That prototype proves the PipeWire API and basic data path, not production readiness. It still needs stronger format-change and stream-state handling, an interruptible sender worker rather than repeated 250-microsecond polling, complete shutdown cleanup on every error, xrun/queue-age telemetry, and committed automated tests. It must also report the actual PipeWire quantum and callback frame distribution instead of assuming the requested `node.latency` was honored. The FFmpeg sender stays installed and remains the A/B reference until this work is brought into the repository and passes sustained tests.
+
+A separate Pulse-based Rust sender feasibility test produced similar packet cadence to FFmpeg in short localhost runs. It did not show a meaningful latency improvement, so the more promising Linux direction is a native PipeWire client, not another Pulse wrapper.
+
+### Language and Carla boundary
+
+- Rust: packet transport, bounded queues, adaptive buffering, format conversion, timing and health metrics.
+- C++/WDK: only if a purpose-built Windows capture driver is eventually justified. A signed kernel driver is a substantially larger project and is not needed to prove the WASAPI renderer.
+- TypeScript: optional configuration and diagnostics UI only. It is not part of the audio callback or packet pump.
+- Carla: keep one DSP engine. A second Carla instance duplicates the rack, DSP work, and routing complexity. `--no-gui` removes the editor, not the processing engine. The previous headless standalone backend had SIGSEGV incidents, so continue supervising the single instance and compare PipeWire filter-chain only as an isolated reproduction of the saved LV2 rack. Do not change the live preset as part of transport migration.
 
 ## Acceptance criteria for any replacement
 
@@ -75,3 +93,32 @@ Keep a replacement off the live route until it passes all of these against the c
 6. A one-command rollback to the current sender and receiver.
 
 The objective is lower observed end-to-end latency while retaining quality, not a smaller buffer setting on paper.
+
+
+## Rust WASAPI receiver candidate (not production)
+
+A separate Windows-only Rust executable is being developed under `crates/roaring-mic-windows`. It preserves the current 48 kHz mono S16LE UDP protocol and uses:
+
+- `wasapi` for IAudioClient3 event-driven shared-mode rendering.
+- `rtrb` for a bounded single-producer/single-consumer sample ring.
+- A dedicated UDP thread with an exact sender-IP allow-list and packet validation.
+- MMCSS `Pro Audio` scheduling for the render thread and AboveNormal scheduling for the UDP worker. The stream uses the neutral `Other` category so it does not request Communications ducking of unrelated Windows audio.
+- A safe initial packet floor, automatic re-priming after actual output underruns, bounded queue growth, and queue/event/drop diagnostics.
+- A `--silent` mode that consumes real UDP data and drives the WASAPI event loop but outputs silence. This permits a parallel test while the existing microphone signal remains the only audible stream.
+
+### Windows endpoint measurements
+
+The Windows laptop reports these IAudioClient3 shared-mode capabilities at 48 kHz:
+
+| Endpoint | Minimum | Default |
+|---|---:|---:|
+| CABLE Input (render) | 128 frames / 2.67 ms | 480 frames / 10 ms |
+| CABLE Output (capture) | 480 frames / 10 ms | 480 frames / 10 ms |
+
+A WASAPI event-driven capability test on CABLE Input at 128 frames reported a 280-frame engine buffer (5.83 ms), with roughly 2.02 ms median and 2.66 ms p95 event wake intervals. The full isolated UDP-to-WASAPI test then received 2,816 packets in 30 seconds with no wrong-source packets, queue drops, event timeouts, or underrun frames using a two-packet prebuffer. A one-packet run received the same packet count but recorded one 128-frame output underrun. A 256-frame run also had zero underruns, but its engine buffer was 562 frames (11.71 ms). These were silent-output tests; they did not duplicate the live microphone into the cable.
+
+The candidate therefore starts with 128-frame shared-mode rendering and a two-packet floor. One packet is not the default. These are endpoint and pipeline measurements, not an end-to-end acoustic latency measurement. The candidate has not replaced WaveOut and must not be installed as the automatic receiver until a native Windows build, sustained test, real-audio handover, and rollback test all pass.
+
+### Build checks
+
+The repository now has a Rust workflow that runs Linux core tests, Windows-target type-checking, native Windows MSVC builds, Clippy with warnings denied, and the existing PowerShell receiver regression suite. The Windows build artifact is kept separate from the installed receiver.

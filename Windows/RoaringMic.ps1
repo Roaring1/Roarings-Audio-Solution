@@ -39,7 +39,7 @@ try { $Cfg.Port = [Math]::Max(1,[Math]::Min(65535,[int]$Cfg.Port)) }
 catch { $Cfg.Port = 46001 }
 try { $Cfg.PreBufPkts = [Math]::Max(1,[Math]::Min(8,[int]$Cfg.PreBufPkts)) }
 catch { $Cfg.PreBufPkts = 5 }
-try { $Cfg.SafePreBufPkts = [Math]::Max(2,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) }
+try { $Cfg.SafePreBufPkts = [Math]::Max(1,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) }
 catch { $Cfg.SafePreBufPkts = 2 }
 try { $Cfg.SafePreBufRate = [Math]::Max(8000,[Math]::Min(192000,[int]$Cfg.SafePreBufRate)) }
 catch { $Cfg.SafePreBufRate = 48000 }
@@ -89,6 +89,13 @@ public static class WaveRouter {
     [DllImport("winmm.dll")] static extern uint waveOutReset(IntPtr h);
     [DllImport("winmm.dll")] static extern uint waveOutClose(IntPtr h);
 
+    [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref uint taskIndex);
+    [DllImport("avrt.dll", SetLastError = true)]
+    static extern bool AvSetMmThreadPriority(IntPtr avrtHandle, int priority);
+    [DllImport("avrt.dll", SetLastError = true)]
+    static extern bool AvRevertMmThreadCharacteristics(IntPtr avrtHandle);
+
     const uint WHDR_DONE = 0x00000001u;
     const ushort WAVE_FORMAT_PCM = 1;
 
@@ -119,11 +126,17 @@ public static class WaveRouter {
     public static volatile float ArrivalJitterMs = 0f;
     public static volatile bool LastArrivalWasLate = false;
     public static volatile int Underruns = 0;
+    public static volatile int InFlight = 0;
+    public static int CompletedBuffers = 0;
+    public static volatile float LastArrivalIntervalMs = 0f;
+    public static volatile float LastBufferCompletionMs = 0f;
     public static volatile bool Primed = false;
+    public static volatile string MmcssMode = "not-started";
+    public static volatile string ActiveDeviceName = "unselected";
     private static long LastArrivalStopwatchTicks = 0;
     private static double LastPacketDurationMs = 0.0;
     private static int StableArrivalCount = 0;
-    // Start at one graph-aligned packet, then learn a per-peer safe floor from
+    // Start at the proven two-packet baseline, then learn a per-peer safe floor from
     // actual WaveOut underruns. Persisted floors are scoped to peer, rate, and
     // packet size so a changed route/profile gets a fresh low-latency trial.
     public static volatile int MinAutoPreBuf = 2;
@@ -163,10 +176,47 @@ public static class WaveRouter {
         return Math.Min(max, Math.Max(current, Math.Max(min, needed)));
     }
 
+    public static int ClampSafePreBuf(int value) {
+        return Math.Max(1, Math.Min(MaxAutoPreBuf, value));
+    }
+
     public static int CalculateNextSafePreBuf(int currentFloor, int max) {
         if (max < 1) max = 1;
         currentFloor = Math.Max(1, Math.Min(max, currentFloor));
         return Math.Min(max, currentFloor + 1);
+    }
+
+    public static IntPtr EnterAudioScheduling() {
+        uint taskIndex = 0;
+        try {
+            IntPtr h = AvSetMmThreadCharacteristics("Pro Audio", ref taskIndex);
+            if (h != IntPtr.Zero) {
+                AvSetMmThreadPriority(h, 1); // AVRT_PRIORITY_HIGH, not Critical.
+                MmcssMode = "Pro Audio";
+                return h;
+            }
+            taskIndex = 0;
+            h = AvSetMmThreadCharacteristics("Audio", ref taskIndex);
+            if (h != IntPtr.Zero) {
+                AvSetMmThreadPriority(h, 1);
+                MmcssMode = "Audio";
+                return h;
+            }
+        } catch {}
+        try {
+            Thread.CurrentThread.Priority = ThreadPriority.AboveNormal;
+            MmcssMode = "AboveNormal fallback";
+        } catch {
+            MmcssMode = "Normal fallback";
+        }
+        return IntPtr.Zero;
+    }
+
+    public static void ReleaseAudioScheduling(IntPtr handle) {
+        if (handle != IntPtr.Zero) {
+            try { AvRevertMmThreadCharacteristics(handle); } catch {}
+        }
+        MmcssMode = "stopped";
     }
 
     private static void ObservePacketArrival(int packetBytes) {
@@ -189,6 +239,7 @@ public static class WaveRouter {
         long previous = Interlocked.Exchange(ref LastArrivalStopwatchTicks, now);
         if (previous > 0 && LastPacketDurationMs > 0.0) {
             double intervalMs = (now - previous) * 1000.0 / Stopwatch.Frequency;
+            LastArrivalIntervalMs = (float)intervalMs;
             double deviation = Math.Abs(intervalMs - LastPacketDurationMs);
             ArrivalJitterMs = (float)(ArrivalJitterMs * 0.875 + deviation * 0.125);
             LastArrivalWasLate = IsPacketArrivalLate(intervalMs, LastPacketDurationMs);
@@ -238,6 +289,10 @@ public static class WaveRouter {
         PktsReceived = 0; PktsDropped = 0; PktsRejected = 0; SourceIP = "--";
         Underruns = 0; Primed = false; ArrivalJitterMs = 0f;
         LastArrivalWasLate = false;
+        InFlight = 0;
+        CompletedBuffers = 0;
+        LastArrivalIntervalMs = 0f;
+        LastBufferCompletionMs = 0f;
         LastPacketBytes = 0;
         PacketProfileChecked = false;
         Interlocked.Exchange(ref ClippedSamples, 0);
@@ -283,7 +338,7 @@ public static class WaveRouter {
             var c = new WAVEOUTCAPS();
             waveOutGetDevCaps(i, ref c, (uint)Marshal.SizeOf(c));
             if (c.szPname != null && c.szPname.IndexOf(DeviceNeedle, StringComparison.OrdinalIgnoreCase) >= 0)
-                { devIdx = i; break; }
+                { devIdx = i; ActiveDeviceName = c.szPname; break; }
         }
         if (devIdx < 0) {
             LastError = "Device '" + DeviceNeedle + "' not found among " + numDevs + " waveOut devices.";
@@ -301,9 +356,11 @@ public static class WaveRouter {
 
         int hSz = Marshal.SizeOf(typeof(WAVEHDR));
         IntPtr[] dataPtrs = new IntPtr[NBUF]; IntPtr[] hdrPtrs = new IntPtr[NBUF]; bool[] busy = new bool[NBUF];
+        long[] writeTicks = new long[NBUF];
         UdpClient udp = null;
         var hold = new System.Collections.Generic.Queue<byte[]>();
         int nativeFailureStreak = 0;
+        IntPtr mmcssHandle = EnterAudioScheduling();
         try {
             for (int i = 0; i < NBUF; i++) {
                 dataPtrs[i] = Marshal.AllocHGlobal(BUFSZ);
@@ -355,6 +412,13 @@ public static class WaveRouter {
                     if (!busy[i]) continue;
                     var hck = (WAVEHDR)Marshal.PtrToStructure(hdrPtrs[i], typeof(WAVEHDR));
                     if ((hck.dwFlags & WHDR_DONE) != 0) {
+                        long writtenAt = writeTicks[i];
+                        if (writtenAt > 0) {
+                            double completionMs = (Stopwatch.GetTimestamp() - writtenAt) * 1000.0 / Stopwatch.Frequency;
+                            LastBufferCompletionMs = (float)(LastBufferCompletionMs * 0.875 + completionMs * 0.125);
+                            Interlocked.Increment(ref CompletedBuffers);
+                            writeTicks[i] = 0;
+                        }
                         waveOutUnprepareHeader(hwo, hdrPtrs[i], (uint)hSz); busy[i] = false;
                     } else { inFlight++; }
                 }
@@ -363,6 +427,7 @@ public static class WaveRouter {
                 // keep the stream primed and immediately queue the new packet.
                 // Only re-prime and grow the buffer when the measured arrival
                 // gap exceeds one packet duration plus the scheduling tolerance.
+                InFlight = inFlight;
                 if (Primed && inFlight == 0 && LastArrivalWasLate) {
                     Primed = false;
                     Underruns++;
@@ -415,7 +480,10 @@ public static class WaveRouter {
                         continue;
                     }
                     nativeFailureStreak = 0;
+                    writeTicks[slot] = Stopwatch.GetTimestamp();
                     busy[slot] = true;
+                    inFlight++;
+                    InFlight = inFlight;
                 }
             }
         } catch (Exception ex) {
@@ -423,7 +491,7 @@ public static class WaveRouter {
         } finally {
             VuLevel = 0f;
             try { if (udp != null) udp.Close(); } catch {}
-            waveOutReset(hwo); Thread.Sleep(150);
+            waveOutReset(hwo); InFlight = 0; Thread.Sleep(150);
             for (int i = 0; i < NBUF; i++) {
                 if (busy[i] && hdrPtrs[i] != IntPtr.Zero) {
                     try { waveOutUnprepareHeader(hwo, hdrPtrs[i], (uint)hSz); } catch {}
@@ -431,7 +499,9 @@ public static class WaveRouter {
                 if (dataPtrs[i] != IntPtr.Zero) Marshal.FreeHGlobal(dataPtrs[i]);
                 if (hdrPtrs[i] != IntPtr.Zero) Marshal.FreeHGlobal(hdrPtrs[i]);
             }
-            waveOutClose(hwo); Running = false;
+            waveOutClose(hwo);
+            ReleaseAudioScheduling(mmcssHandle);
+            Running = false;
         }
     }
 
@@ -473,9 +543,11 @@ function Start-Recv {
         [WaveRouter]::ConfiguredPreBuf = [int]$Cfg.PreBufPkts
         [WaveRouter]::AllowedSourceIP = [string]$Cfg.PcHost
         $profileMatches = [WaveRouter]::IsSafePreBufPeerRateMatch([string]$Cfg.SafePreBufPeerIP, [string]$Cfg.PcHost, [int]$Cfg.SafePreBufRate, [int]$Cfg.Rate)
-        [WaveRouter]::MinAutoPreBuf = if ($profileMatches) { [Math]::Max(2,[Math]::Min(8,[int]$Cfg.SafePreBufPkts)) } else { 2 }
+        [WaveRouter]::MinAutoPreBuf = if ($profileMatches) { [WaveRouter]::ClampSafePreBuf([int]$Cfg.SafePreBufPkts) } else { 2 }
         [WaveRouter]::ExpectedPacketBytes = if ($profileMatches) { [int]$Cfg.SafePreBufPacketBytes } else { 0 }
         [WaveRouter]::ResetCounters()
+        $script:AudioThreadDiagLogged = $false
+$script:ReceiverHealthLogAt = [datetime]::MinValue
         Write-ReceiverHealthDiagnostic "profile-loaded peer=$($Cfg.PcHost) rate=$($Cfg.Rate) expectedPacketBytes=$([WaveRouter]::ExpectedPacketBytes) safeFloor=$([WaveRouter]::MinAutoPreBuf) matched=$profileMatches"
         # Arm before dispatch so an immediate Stop cannot be overwritten by
         # Run() starting later on the worker thread.
@@ -692,6 +764,7 @@ function Save-ReceiverConfig {
 
 $script:SafeProfileSaveRetryAt = [datetime]::MinValue
 $script:SafeProfileDiagAt = [datetime]::MinValue
+$script:AudioThreadDiagLogged = $false
 $script:SafeProfileDiagPath = "$AppDir\receiver-health.log"
 function Write-ReceiverHealthDiagnostic([string]$Message) {
     try {
@@ -707,6 +780,16 @@ function Save-LearnedSafeBufferProfile {
             $script:SafeProfileDiagAt = [datetime]::Now.AddSeconds(30)
         }
         return
+    }
+    if (-not $script:AudioThreadDiagLogged) {
+        Write-ReceiverHealthDiagnostic "receiver-active device=$([WaveRouter]::ActiveDeviceName) mmcss=$([WaveRouter]::MmcssMode) packetBytes=$([WaveRouter]::LastPacketBytes) arrivalMs=$([Math]::Round([WaveRouter]::LastArrivalIntervalMs,2)) doneMs=$([Math]::Round([WaveRouter]::LastBufferCompletionMs,2)) safeFloor=$([WaveRouter]::MinAutoPreBuf) currentBuffer=$([WaveRouter]::PreBuf) inFlight=$([WaveRouter]::InFlight) jitterMs=$([WaveRouter]::ArrivalJitterMs)"
+        $script:AudioThreadDiagLogged = $true
+    }
+    if ([datetime]::Now -ge $script:ReceiverHealthLogAt) {
+        $packetMs = [WaveRouter]::LastPacketBytes * 500.0 / [WaveRouter]::Rate
+        $queueMs = [WaveRouter]::InFlight * $packetMs
+        Write-ReceiverHealthDiagnostic "receiver-health device=$([WaveRouter]::ActiveDeviceName) mmcss=$([WaveRouter]::MmcssMode) safeFloor=$([WaveRouter]::MinAutoPreBuf) currentBuffer=$([WaveRouter]::PreBuf) inFlight=$([WaveRouter]::InFlight) queueMs=$([Math]::Round($queueMs,2)) arrivalMs=$([Math]::Round([WaveRouter]::LastArrivalIntervalMs,2)) doneMs=$([Math]::Round([WaveRouter]::LastBufferCompletionMs,2)) completed=$([WaveRouter]::CompletedBuffers) underruns=$([WaveRouter]::Underruns) dropped=$([WaveRouter]::PktsDropped) rejected=$([WaveRouter]::GetRejectedPackets()) jitterMs=$([WaveRouter]::ArrivalJitterMs)"
+        $script:ReceiverHealthLogAt = [datetime]::Now.AddSeconds(30)
     }
     if ([datetime]::Now -lt $script:SafeProfileSaveRetryAt) { return }
 
@@ -726,7 +809,7 @@ function Save-LearnedSafeBufferProfile {
     $Cfg.SafePreBufPacketBytes = $packetBytes
     if (Save-ReceiverConfig) {
         $script:SafeProfileSaveRetryAt = [datetime]::MinValue
-        Write-ReceiverHealthDiagnostic "profile-saved peer=$($Cfg.SafePreBufPeerIP) rate=$($Cfg.SafePreBufRate) packetBytes=$($Cfg.SafePreBufPacketBytes) safeFloor=$($Cfg.SafePreBufPkts) currentBuffer=$([WaveRouter]::PreBuf) underruns=$([WaveRouter]::Underruns) jitterMs=$([WaveRouter]::ArrivalJitterMs)"
+        Write-ReceiverHealthDiagnostic "profile-saved peer=$($Cfg.SafePreBufPeerIP) rate=$($Cfg.SafePreBufRate) packetBytes=$($Cfg.SafePreBufPacketBytes) safeFloor=$($Cfg.SafePreBufPkts) currentBuffer=$([WaveRouter]::PreBuf) underruns=$([WaveRouter]::Underruns) jitterMs=$([WaveRouter]::ArrivalJitterMs) mmcss=$([WaveRouter]::MmcssMode)"
     } else {
         Write-ReceiverHealthDiagnostic "profile-save-failed peer=$($Cfg.SafePreBufPeerIP) packetBytes=$($Cfg.SafePreBufPacketBytes)"
         # Restore the in-memory snapshot so the next timer tick retries rather
