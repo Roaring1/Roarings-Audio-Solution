@@ -19,14 +19,19 @@ The current measured baseline is 48 kHz with a 512-frame PipeWire graph quantum:
 
 - 512 / 48000 = 10.67 ms per graph cycle.
 - The Scarlett capture node negotiates a 128-frame ALSA period (2.67 ms).
-- The Linux sender selects a 960-byte mono PCM fragment (10 ms).
+- The Linux sender aligns one mono s16le datagram to one graph quantum (1,024 bytes / 10.67 ms at 512 frames).
 - Carla is in Continuous Rack mode, a single-client rack processing mode.
 - Carla used about 6-8% of the observed graph-cycle processing budget during the live checks.
 - The Scarlett capture-node ERR count did not increase during the latest 16-second steady-state window at 512 frames.
-- The Windows receiver's auto mode starts with a two-packet floor, can grow to eight packets on late arrivals, and slowly returns toward the floor after stable traffic.
+- The Windows receiver's auto mode starts with one graph-aligned packet, grows up to eight on late arrivals, and learns a persistent per-peer/rate/packet-size safety floor only after an actual WaveOut underrun. The active queue decays toward that floor after 60 seconds of stable arrivals; the learned floor relaxes one step only after ten clean wall-clock minutes. The profile is saved by the always-running status timer, not by opening the tray flyout.
 - The Windows UDP receive socket is capped at 8 KiB to prevent seconds of stale queued audio after a scheduling stall.
 
 A 256-frame graph (5.33 ms) was exercised, but it produced additional Scarlett xruns under the machine's normal load. The safe default is therefore 512 frames. ROARING_MIC_MIN_QUANTUM=256 is an explicit opt-in for further trials, not the default. A new xrun steps the graph up (256 -> 512 -> 1024); the sender's monitor retries lower settings only after a clean interval. Carla's session applies the 512-frame graph force after its JACK node appears, so a Carla restart does not silently restore the 1024-frame default.
+
+
+### Graph-aligned packet sizing
+
+A localhost A/B on the live 512-frame graph compared 960-byte (480-sample / 10 ms) and 1,024-byte (512-sample / 10.67 ms) FFmpeg capture fragments. Both remained stable with no capture interruption. The 1,024-byte packet represents exactly one 512-frame graph quantum, so the Windows receiver's calculated packet duration matches the sender's graph cadence instead of receiving 10 ms of audio every 10.67 ms. Measured arrival p95 was 10.867 ms for 1,024-byte packets and 10.850 ms for 960-byte packets; median cadence was effectively unchanged. The important difference was burstiness: 960-byte packets produced back-to-back arrivals as short as 0.007 ms (p05 0.011 ms), while 1,024-byte packets had a 10.256 ms minimum interval (p05 10.446 ms). Exact graph alignment removes the short-packet burst caused by a 10 ms payload arriving on a 10.67 ms graph cadence. This is the preferred 512-frame packet profile.
 
 The graph period is not the whole end-to-end delay. Carla reports 260 samples of plugin latency (about 5.42 ms at 48 kHz). The saved rack has two visible lookahead settings: LSP Gate Mono at 0.5 ms and LSP Limiter Mono at 5 ms. Their combined configured lookahead is 5.5 ms, close to Carla's 5.42 ms report, so they are strong candidates for most of the plugin delay. This is not yet an isolated per-plugin measurement.
 

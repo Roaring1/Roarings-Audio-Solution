@@ -20,11 +20,11 @@ MIC_SOURCE="${MIC_SOURCE:-b1_mic}"
 MIC_PORT="${MIC_PORT:-46001}"
 RATE=48000
 CHANNELS=1
-# Pulse fragment is mono s16le bytes. Auto selects 5/10/20 ms from graph quantum.
+# Pulse fragment is mono s16le bytes. Auto aligns one packet to one PipeWire graph quantum.
 PULSE_FRAGMENT_OVERRIDE="${PULSE_FRAGMENT_BYTES:-}"
 PULSE_FRAGMENT_BYTES=960
 PULSE_FRAGMENT_FALLBACK=0
-PULSE_FRAGMENT_MAX=1920
+PULSE_FRAGMENT_MAX=4096
 # Learned minimum stable graph period for this machine. Set
 # ROARING_MIC_MIN_QUANTUM=256 only to opt into further 5.33 ms trials.
 MIN_SAFE_QUANTUM="$(printenv ROARING_MIC_MIN_QUANTUM 2>/dev/null || echo 512)"
@@ -200,14 +200,17 @@ select_capture_fragment() {
 
   if [[ -z "$PULSE_FRAGMENT_OVERRIDE" && $PULSE_FRAGMENT_FALLBACK -eq 0 ]]; then
     if [[ "$quantum" =~ ^[0-9]+$ ]]; then
-      if (( quantum <= 256 )); then
-        PULSE_FRAGMENT_BYTES=480
-      elif (( quantum < 2048 )); then
-        # One 10 ms PCM block at 48 kHz mono. Larger reads are split into
-        # multiple UDP datagrams by the muxer without improving cadence.
-        PULSE_FRAGMENT_BYTES=960
+      if (( quantum <= 2048 )); then
+        # One complete graph quantum per datagram (mono s16le = 2 bytes/frame).
+        # Aligning payload duration with graph cadence avoids a systematic
+        # short-packet gap at the Windows WaveOut boundary (e.g. 10 ms payload
+        # arriving every 10.67 ms at a 512-frame graph).
+        PULSE_FRAGMENT_BYTES=$(( quantum * 2 ))
+        if (( PULSE_FRAGMENT_BYTES < 480 )); then
+          PULSE_FRAGMENT_BYTES=480
+        fi
       else
-        PULSE_FRAGMENT_BYTES=1920
+        PULSE_FRAGMENT_BYTES=$PULSE_FRAGMENT_MAX
       fi
     else
       quantum="unknown"
@@ -217,7 +220,8 @@ select_capture_fragment() {
     quantum="unknown"
   fi
 
-  local fragment_ms=$(( PULSE_FRAGMENT_BYTES * 1000 / (RATE * 2) ))
+  local fragment_ms
+  fragment_ms="$(awk -v b="$PULSE_FRAGMENT_BYTES" -v r="$RATE" 'BEGIN { printf "%.2f", b*1000/(r*2) }')"
   local quantum_ms="unknown"
   if [[ "$quantum" =~ ^[0-9]+$ ]]; then
     quantum_ms="$(awk -v q="$quantum" -v r="$RATE" 'BEGIN { printf "%.2f", q*1000/r }')"

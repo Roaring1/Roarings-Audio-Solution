@@ -100,21 +100,63 @@ Assert-True ([WaveRouter]::GetClippedSamples() -eq 3) '200 percent clipping coun
 
 # Adaptive packet buffering stays at the low floor under normal timing, grows
 # quickly when a datagram is late, and never exceeds the bounded device queue.
-Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 10.5, 10.0, 2, 8) -eq 2) 'adaptive buffer preserves low floor for normal packet timing'
-Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 16.0, 10.0, 2, 8) -eq 3) 'adaptive buffer grows after delayed packet'
-Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 25.0, 10.0, 2, 8) -eq 4) 'adaptive buffer grows after a second severe delay'
-Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 100.0, 10.0, 2, 8) -eq 8) 'adaptive buffer clamps severe delay to queue cap'
-Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 0.0, 10.0, 2, 8) -eq 2) 'adaptive buffer enforces minimum floor'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 10.5, 10.0, 1, 8) -eq 1) 'adaptive buffer preserves one-packet floor for normal timing'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 16.0, 10.0, 1, 8) -eq 2) 'adaptive buffer grows after delayed packet'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(2, 25.0, 10.0, 1, 8) -eq 3) 'adaptive buffer grows after a second severe delay'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(3, 100.0, 10.0, 1, 8) -eq 8) 'adaptive buffer clamps severe delay to queue cap'
+Assert-True ([WaveRouter]::CalculateAdaptivePreBuf(1, 0.0, 10.0, 1, 8) -eq 1) 'adaptive buffer enforces configured minimum floor'
+Assert-True ([WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.123',48000,48000)) 'learned queue profile is scoped to matching peer and rate'
+Assert-True (-not [WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.124',48000,48000)) 'learned queue profile is rejected for a different peer'
+Assert-True (-not [WaveRouter]::IsSafePreBufPeerRateMatch('192.168.50.123','192.168.50.123',48000,44100)) 'learned queue profile is rejected for a different sample rate'
+Assert-True ([WaveRouter]::IsSafePreBufPacketSizeMatch(1024,1024)) 'learned queue profile accepts matching packet size'
+Assert-True (-not [WaveRouter]::IsSafePreBufPacketSizeMatch(960,1024)) 'learned queue profile resets after graph packet-size change'
 Assert-True (-not [WaveRouter]::IsPacketArrivalLate(5.3, 5.0)) 'normal packet-boundary completion is not classified as late'
 Assert-True (-not [WaveRouter]::IsPacketArrivalLate(6.9, 5.0)) 'small scheduling variation is tolerated'
 Assert-True ([WaveRouter]::IsPacketArrivalLate(7.1, 5.0)) 'late packet gap is detected'
 Assert-True ($source.Contains('inFlight == 0 && LastArrivalWasLate')) 'natural WaveOut packet completion does not count as underrun'
+$underrunStart = $source.IndexOf('if (Primed && inFlight == 0 && LastArrivalWasLate) {')
+$underrunEnd = $source.IndexOf('if (!Primed)', $underrunStart)
+$underrunBlock = if ($underrunStart -ge 0 -and $underrunEnd -gt $underrunStart) { $source.Substring($underrunStart, $underrunEnd - $underrunStart) } else { '' }
+Assert-True ($underrunBlock.Length -gt 0 -and -not $underrunBlock.Contains('PreBuf++')) 'one late packet cannot double-increase the adaptive prebuffer'
 Assert-True ($source.Contains('StableArrivalCount >= 6000')) 'adaptive buffer reduction requires sustained stability'
+Assert-True ($source.Contains('Stopwatch.Frequency * 600L')) 'learned safe floor only decreases after ten wall-clock minutes of stability'
+Assert-True ($source.Contains('MinAutoPreBuf = PreBuf')) 'actual WaveOut underrun raises the learned connection floor'
+Assert-True ($source.Contains('Save-ReceiverConfig')) 'learned connection profile is persisted outside the audio receive loop'
+$saveProfileMatch = [regex]::Match($source, '(?ms)^function Save-LearnedSafeBufferProfile \{.*?^\}')
+Assert-True $saveProfileMatch.Success 'learned profile save helper can be isolated for testing'
+Invoke-Expression $saveProfileMatch.Value
+$Cfg = [PSCustomObject]@{ SafePreBufPkts = 1; SafePreBufPeerIP = ''; SafePreBufRate = 48000; SafePreBufPacketBytes = 0; PcHost = '192.168.50.123'; Rate = 48000 }
+$script:SafeProfileSaveRetryAt = [datetime]::MinValue
+$script:ProfileWriteCount = 0
+function Save-ReceiverConfig { $script:ProfileWriteCount++; return $true }
+[WaveRouter]::AdaptiveBuffering = $true
+[WaveRouter]::MinAutoPreBuf = 1
+[WaveRouter]::LastPacketBytes = 1024
+[WaveRouter]::LastPacketTicks = [datetime]::UtcNow.Ticks
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 1 -and $Cfg.SafePreBufPeerIP -eq '192.168.50.123' -and $Cfg.SafePreBufPacketBytes -eq 1024) 'learned profile saves peer, rate, packet size and safe floor'
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 1) 'unchanged learned profile is not rewritten each timer tick'
+function Save-ReceiverConfig { $script:ProfileWriteCount++; return $false }
+[WaveRouter]::MinAutoPreBuf = 2
+[WaveRouter]::LastPacketBytes = 2048
+[WaveRouter]::LastPacketTicks = [datetime]::UtcNow.Ticks
+Save-LearnedSafeBufferProfile
+Assert-True ($Cfg.SafePreBufPkts -eq 1 -and $Cfg.SafePreBufPacketBytes -eq 1024 -and $script:ProfileWriteCount -eq 2) 'failed profile write restores the in-memory snapshot'
+Save-LearnedSafeBufferProfile
+Assert-True ($script:ProfileWriteCount -eq 2) 'failed profile write uses a retry delay instead of repeated writes'
+Assert-True ($source.Contains('function Save-LearnedSafeBufferProfile')) 'learned profile persistence has a dedicated helper'
+$pollStart = $source.IndexOf('$Poll.add_Tick')
+$profileSaveCall = $source.IndexOf('Save-LearnedSafeBufferProfile', $pollStart)
+$refreshCall = $source.IndexOf('Refresh-Flyout', $pollStart)
+Assert-True ($pollStart -ge 0 -and $profileSaveCall -gt $pollStart -and $refreshCall -gt $profileSaveCall) 'learned profile persists from the always-running timer before optional flyout refresh'
+Assert-True ($source.Contains('SafeProfileSaveRetryAt')) 'failed profile writes are retried without balloon-notification spam'
 
 [WaveRouter]::AdaptiveBuffering = $true
 [WaveRouter]::ConfiguredPreBuf = 5
+[WaveRouter]::MinAutoPreBuf = 1
 [WaveRouter]::ResetCounters()
-Assert-True ([WaveRouter]::PreBuf -eq 2) 'automatic mode starts at two packet floor'
+Assert-True ([WaveRouter]::PreBuf -eq 1) 'automatic mode starts at one packet floor'
 [WaveRouter]::AdaptiveBuffering = $false
 [WaveRouter]::ConfiguredPreBuf = 5
 [WaveRouter]::ResetCounters()

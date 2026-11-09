@@ -132,15 +132,15 @@ enforce_carla
         script_path = ROOT / "Bin/roaring_moonlight_micd.sh"
         cases = (
             ("128", "0", "", "0", "480"),
-            ("256", "0", "", "0", "480"),
-            ("512", "0", "", "0", "960"),
-            ("1024", "0", "", "0", "960"),
-            ("2048", "0", "", "0", "1920"),
+            ("256", "0", "", "0", "512"),
+            ("512", "0", "", "0", "1024"),
+            ("1024", "0", "", "0", "2048"),
+            ("2048", "0", "", "0", "4096"),
             ("unknown", "0", "", "0", "960"),
-            ("1024", "256", "", "0", "480"),
-            ("1024", "512", "", "0", "960"),
+            ("1024", "256", "", "0", "512"),
+            ("1024", "512", "", "0", "1024"),
             ("1024", "0", "768", "0", "768"),
-            ("1024", "0", "241", "0", "960"),
+            ("1024", "0", "241", "0", "2048"),
             ("1024", "0", "0480", "0", "480"),
             ("256", "0", "", "1", "1920"),
         )
@@ -159,7 +159,7 @@ RATE=48000
 PULSE_FRAGMENT_OVERRIDE="$TEST_OVERRIDE"
 PULSE_FRAGMENT_BYTES=1920
 PULSE_FRAGMENT_FALLBACK="$TEST_FALLBACK"
-PULSE_FRAGMENT_MAX=1920
+PULSE_FRAGMENT_MAX=4096
 log() { :; }
 pw-metadata() {
   if [[ "$TEST_QUANTUM" != unknown ]]; then
@@ -541,7 +541,7 @@ echo 'R 95 512 48000 600us 1us 0.06 0.00 3 S32LE 2 48000 alsa_input.usb-Focusrit
         self.assertIn("-channels \"$CHANNELS\"", source)
         self.assertIn("-fragment_size \"$PULSE_FRAGMENT_BYTES\"", source)
         self.assertIn("-fflags +nobuffer", source)
-        self.assertIn("PULSE_FRAGMENT_MAX=1920", source)
+        self.assertIn("PULSE_FRAGMENT_MAX=4096", source)
         self.assertIn("PULSE_FRAGMENT_FALLBACK=1", source)
         self.assertIn("ran >= 600", source)
 
