@@ -2,7 +2,7 @@
 Description=Run a short B1 audio quality sample every ten minutes
 
 [Timer]
-OnBootSec=3min
+OnActiveSec=3min
 OnUnitActiveSec=10min
 RandomizedDelaySec=45s
 AccuracySec=1min
