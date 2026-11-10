@@ -303,15 +303,23 @@ def notify(title: str, body: str, *, urgency: str = "critical") -> None:
 
 
 _B1_ACTIVE_CACHE: tuple[float, bool] = (0.0, False)
+_B1_ACTIVE_CACHE_SECONDS = 0.5
 
 
 def _b1_expected_active() -> bool:
-    """Do not diagnose an intentionally disabled or muted B1 bus as a dropout."""
+    """Return true only when B1 is routed and neither endpoint is muted.
+
+    The scheduled sampler uses this as a capture gate. Both the B1 sink and
+    remapped B1 source are checked so the user's normal mute control is honored
+    regardless of which endpoint the desktop/app toggles. Query errors fail
+    closed: a mute state that cannot be established is not permission to record.
+    """
     global _B1_ACTIVE_CACHE
     cached_until, cached_value = _B1_ACTIVE_CACHE
     now = time.monotonic()
     if now < cached_until:
         return cached_value
+
     flags: dict[str, str] = {}
     try:
         for line in ROUTER_CONFIG_PATH.read_text(encoding="utf-8").splitlines():
@@ -322,19 +330,28 @@ def _b1_expected_active() -> bool:
             if key in {"B1_ACTIVE", "CARLA_TO_B1"}:
                 flags[key] = value.lower()
     except OSError:
-        _B1_ACTIVE_CACHE = (now + 2.0, False)
+        _B1_ACTIVE_CACHE = (now + _B1_ACTIVE_CACHE_SECONDS, False)
         return False
+
     if flags.get("B1_ACTIVE") != "true" or flags.get("CARLA_TO_B1") != "true":
-        _B1_ACTIVE_CACHE = (now + 2.0, False)
+        _B1_ACTIVE_CACHE = (now + _B1_ACTIVE_CACHE_SECONDS, False)
         return False
-    try:
-        mute = _run_checked(["pactl", "get-sink-mute", "mic_b1"], timeout=3)
-    except (OSError, subprocess.TimeoutExpired):
-        _B1_ACTIVE_CACHE = (now + 2.0, False)
-        return False
-    active = mute.returncode == 0 and "Mute: no" in mute.stdout
-    _B1_ACTIVE_CACHE = (now + 2.0, active)
-    return active
+
+    for command in (
+        ["pactl", "get-sink-mute", "mic_b1"],
+        ["pactl", "get-source-mute", "b1_mic"],
+    ):
+        try:
+            mute = _run_checked(command, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            _B1_ACTIVE_CACHE = (now + _B1_ACTIVE_CACHE_SECONDS, False)
+            return False
+        if mute.returncode != 0 or "Mute: no" not in mute.stdout:
+            _B1_ACTIVE_CACHE = (now + _B1_ACTIVE_CACHE_SECONDS, False)
+            return False
+
+    _B1_ACTIVE_CACHE = (now + _B1_ACTIVE_CACHE_SECONDS, True)
+    return True
 
 
 def _carla_processes(proc_root: pathlib.Path = pathlib.Path("/proc")) -> list[tuple[int, list[str], str]]:
@@ -812,10 +829,36 @@ def classify_sample(summary: dict) -> tuple[str, str]:
     return "CORRECT", "Enough active windows matched the expected raw-to-B1 path"
 
 
+def _muted_summary() -> dict:
+    """A mute-gated no-op result: no PCM capture was opened or retained."""
+    return {
+        "sample_seconds": 0.0,
+        "windows": 0,
+        "active_windows": 0,
+        "valid_windows": 0,
+        "candidate_windows": 0,
+        "dropout_windows": 0,
+        "fault_confirmed": False,
+        "raw_rms_p50": None,
+        "raw_rms_p90": None,
+        "raw_rms_p99": None,
+        "post_rms_p50": None,
+        "post_rms_p90": None,
+        "post_rms_p99": None,
+        "correlation_p50": None,
+        "capture_error": None,
+        "muted": True,
+        "verdict": "MUTED",
+        "reason": "B1 is muted or disabled; microphone sampling skipped",
+    }
+
+
 def capture_sample(seconds: float = 8.0) -> dict:
-    """Open two short PCM taps, aggregate features, then close them; never persist audio."""
+    """Open two short PCM taps only while B1 is unmuted; close them on mute."""
     if not 3.0 <= seconds <= 20.0:
         raise ValueError("sample duration must be between 3 and 20 seconds")
+    if not _b1_expected_active():
+        return _muted_summary()
 
     processes: dict[str, subprocess.Popen[bytes]] = {}
     buffers = {RAW_SOURCE: bytearray(), PROCESSED_SOURCE: bytearray()}
@@ -826,6 +869,7 @@ def capture_sample(seconds: float = 8.0) -> dict:
     active_windows = valid_windows = candidate_windows = dropout_windows = 0
     tracker = QualityTracker()
     fault_confirmed = False
+    muted_during_capture = False
     start = time.monotonic()
     capture_error: str | None = None
 
@@ -841,6 +885,11 @@ def capture_sample(seconds: float = 8.0) -> dict:
         start_one(PROCESSED_SOURCE)
         deadline = start + seconds
         while time.monotonic() < deadline:
+            # Re-check at sub-second intervals. If the user mutes mid-sample,
+            # terminate both taps immediately and discard this partial verdict.
+            if not _b1_expected_active():
+                muted_during_capture = True
+                break
             ready = selector.select(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
             for key, _ in ready:
                 device = key.data
@@ -918,9 +967,12 @@ def capture_sample(seconds: float = 8.0) -> dict:
         "post_rms_p99": _percentile(post_levels, 0.99),
         "correlation_p50": _percentile(correlations, 0.50),
         "capture_error": capture_error,
+        "muted": muted_during_capture,
     }
     verdict, reason = classify_sample(summary)
-    if capture_error:
+    if muted_during_capture:
+        verdict, reason = "MUTED", "B1 was muted during sampling; capture taps closed and partial result discarded"
+    elif capture_error:
         verdict, reason = "INCONCLUSIVE", f"Capture could not complete: {capture_error}"
     summary["verdict"] = verdict
     summary["reason"] = reason
@@ -948,7 +1000,11 @@ def run_sample_cycle(seconds: float, config: dict[str, bool]) -> int:
     # A previous verification result belongs only to its own cycle.
     state.pop("last_recheck", None)
     state.pop("last_recheck_at", None)
-    first = capture_sample(seconds)
+    first = capture_sample(seconds) if _b1_expected_active() else _muted_summary()
+    # A mute switch may be toggled immediately after the sample closes. Never
+    # let an old fault verdict trigger recovery after B1 has become muted.
+    if first["verdict"] == "INCORRECT" and not _b1_expected_active():
+        first = _muted_summary()
     LOG.info(
         "B1 audio verdict: %s (%s); windows=%d active=%d valid=%d clicks=%d dropouts=%d "
         "raw_p50=%s raw_p90=%s post_p50=%s post_p90=%s corr_p50=%s",
@@ -969,7 +1025,10 @@ def run_sample_cycle(seconds: float, config: dict[str, bool]) -> int:
                 state = _read_state()
                 state["last_recheck"] = second
                 state["last_recheck_at"] = time.time()
-                if second["verdict"] == "CORRECT":
+                if second["verdict"] == "MUTED":
+                    state["last_verdict"] = "MUTED"
+                    LOG.info("B1 was muted during post-restart verification; capture skipped")
+                elif second["verdict"] == "CORRECT":
                     state["last_verdict"] = "RECOVERED"
                     message = f"{detail}. Verification sample is correct."
                     LOG.warning("B1 recovery verified: %s", message)
