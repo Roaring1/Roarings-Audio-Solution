@@ -73,6 +73,7 @@ SERVICES = [
     ("roaring-audio-routesd", True),
     ("roaring-moonlight-mic",  True),
     ("roaring-laptop-audio",   True),
+    ("lpd8-boot-defaults",    True),
     ("lpd8-mixer",            True),
     ("roaring-carla-session", True),
     ("default-sink-vm-game",  True),
@@ -1045,6 +1046,7 @@ separator { background: rgba(255,255,255,0.06); }
 .pad-mute   { border-color: rgba(255,159,10,0.28); color: rgba(255,159,10,0.60); }
 .pad-action { background: rgba(8,44,84,0.60);
               border-color: rgba(10,132,255,0.30); color: rgba(100,168,255,0.70); }
+.pad-empty  { color: rgba(255,255,255,0.18); }
 .pad-danger { background: rgba(72,12,12,0.70);
               border-color: rgba(255,69,58,0.38); color: rgba(255,105,96,0.80);
               animation: pulse-bad 1.8s ease-in-out infinite; }
@@ -1763,15 +1765,16 @@ def run_app(vu_dump: bool = False):
 
     pad_grid = Gtk.Grid()
     pad_grid.set_column_spacing(3); pad_grid.set_row_spacing(3)
+    # Physical orientation: rear row (5-8) above front row (1-4).
     PAD_DEFS = [
-        ("1\nMUSIC\nMUTE",    "pad-mute"),
-        ("2\nCHAT\nMUTE",     "pad-mute"),
-        ("3\nASTRO\nTARGET",  "pad-action"),
-        ("4\nASTRO HW\n!!!",  "pad-danger"),
-        ("5\nDEBUG\nDUMP",    "pad-action"),
-        ("6\nMIC SRC\nMUTE",  "pad-mute"),
-        ("7\nGAME\nMUTE",     "pad-mute"),
+        ("5\nEMPTY",            "pad-empty"),
+        ("6\nEMPTY",            "pad-empty"),
+        ("7\nEMPTY",            "pad-empty"),
         ("8\nSCARLETT\nMIRR", "pad-action"),
+        ("1\nMIC\nMUTE",       "pad-mute"),
+        ("2\nHEADSET\nMUTE",  "pad-mute"),
+        ("3\nSHOW\nHEARTH",   "pad-action"),
+        ("4\nEMPTY",            "pad-empty"),
     ]
     for pi, (ptxt, pcls) in enumerate(PAD_DEFS):
         pl = Gtk.Label(label=ptxt)
@@ -1781,6 +1784,10 @@ def run_app(vu_dump: bool = False):
         pl.set_size_request(42, 36)
         pad_grid.attach(pl, pi % 4, pi // 4, 1, 1)
     lpd8_inner.pack_start(pad_grid, False, False, 0)
+    pad_note = Gtk.Label(label="LIT = MUTED; DARK = NORMAL")
+    pad_note.set_xalign(0)
+    pad_note.get_style_context().add_class("dim-s")
+    lpd8_inner.pack_start(pad_note, False, False, 0)
 
     knob_ref = Gtk.Label(label="K1·K7=GAME  K5=MUSIC  K6=CHAT  K8=MIC vol")
     knob_ref.set_xalign(0); knob_ref.get_style_context().add_class("dim-s")

@@ -16,6 +16,7 @@ SERVICES=(
   roaring-mic-busses.service
   roaring-mic-routesd.service
   lpd8-mixer.service
+  lpd8-boot-defaults.service
 )
 
 print_hr() {
@@ -131,7 +132,9 @@ print_journal() {
   print_hr
   echo "FILES: relevant configs"
   echo "--------------------------------------------------------------------------------"
-  print_file "$HOME/.config/roaring_mixer.conf"
+  print_file "$HOME/.config/hearth/roaring_mixer.conf"
+  print_file "$HOME/.config/systemd/user/lpd8-boot-defaults.service"
+  print_file "$HOME/.config/systemd/user/lpd8-mixer.service.d/boot-defaults.conf"
   print_file "$HOME/.config/roaring_mic_router.conf"
 
   if [[ -d "$HOME/.config/roaring_audio" ]]; then
