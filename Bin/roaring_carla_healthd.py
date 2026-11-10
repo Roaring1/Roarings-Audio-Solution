@@ -35,19 +35,22 @@ CARLA_PROCESS_ARGV = ("/usr/bin/python3", "/app/share/carla/carla")
 CANONICAL_SERVICE = "roaring-carla-session.service"
 TRANSIENT_SERVICE = "carla-b1-restart.service"
 STATE_PATH = pathlib.Path.home() / ".cache/roaring/carla-healthd-state.json"
+SAMPLE_HISTORY_PATH = pathlib.Path.home() / ".cache/roaring/carla-health-history.jsonl"
 CONFIG_PATH = pathlib.Path.home() / ".config/roaring/carla-health.env"
 ROUTER_CONFIG_PATH = pathlib.Path.home() / ".config/hearth/roaring_mic_router.conf"
 LOG = logging.getLogger("roaring.carla.health")
 
 # Thresholds are deliberately conservative. A candidate must be an output-only
 # transient after alignment, not merely a loud consonant in the raw microphone.
-VOICE_RMS_FLOOR = 0.008
+RAW_ACTIVITY_RMS_FLOOR = 0.00025  # Initial deployed-level gate; refine from numeric sample history.
+MIN_ACTIVE_WINDOWS = 3
+MIN_VALID_ACTIVE_FRACTION = 0.60
 MIN_CORRELATION = 0.30
 MIN_RESIDUAL_HF_PEAK = 0.025
 MIN_RESIDUAL_HF_CREST = 15.0
 MIN_RESIDUAL_HF_KURTOSIS = 10.0
 MAX_RAW_TO_RESIDUAL_HF_PEAK = 0.70
-DROPOUT_RAW_RMS = 0.025
+DROPOUT_RAW_RMS = 0.0012  # Above measured quiet floor, within observed live speech peaks.
 DROPOUT_POST_RMS = 0.0015
 DROPOUT_RATIO = 0.04
 EVENTS_TO_CONFIRM = 3
@@ -170,7 +173,7 @@ def analyze_pair(raw: Sequence[float], processed: Sequence[float]) -> dict[str, 
     post_rms = _rms(processed)
     lag, correlation = _best_alignment(raw, processed)
     result: dict[str, float | int | bool] = {
-        "valid": correlation >= MIN_CORRELATION and raw_rms >= VOICE_RMS_FLOOR,
+        "valid": correlation >= MIN_CORRELATION and raw_rms >= RAW_ACTIVITY_RMS_FLOOR,
         "candidate": False,
         "dropout": False,
         "raw_rms": raw_rms,
@@ -189,7 +192,7 @@ def analyze_pair(raw: Sequence[float], processed: Sequence[float]) -> dict[str, 
         # An intentionally disabled/muted B1 bus is not a processing failure.
         result["dropout"] = _b1_expected_active()
         return result
-    if correlation < MIN_CORRELATION or raw_rms < VOICE_RMS_FLOOR:
+    if correlation < MIN_CORRELATION or raw_rms < RAW_ACTIVITY_RMS_FLOOR:
         return result
 
     if lag >= 0:
@@ -783,9 +786,232 @@ def run_daemon(stop: Callable[[], bool] | None = None) -> int:
     return 0
 
 
+
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int((len(ordered) - 1) * fraction)))
+    return round(float(ordered[index]), 7)
+
+
+def classify_sample(summary: dict) -> tuple[str, str]:
+    """Use three states so silence/poor correlation never causes a restart."""
+    if summary.get("fault_confirmed"):
+        return "INCORRECT", "Repeated output-only crackle or confirmed B1 dropout"
+    active = int(summary.get("active_windows", 0))
+    valid = int(summary.get("valid_windows", 0))
+    candidates = int(summary.get("candidate_windows", 0))
+    dropouts = int(summary.get("dropout_windows", 0))
+    if active < MIN_ACTIVE_WINDOWS:
+        return "NO_SAMPLE", "Not enough raw microphone activity; no recovery action"
+    if candidates or dropouts:
+        return "SUSPECT", "An isolated quality event occurred but did not meet restart confidence"
+    if valid / max(active, 1) < MIN_VALID_ACTIVE_FRACTION:
+        return "INCONCLUSIVE", "Active input was not sufficiently correlated with the processed path"
+    return "CORRECT", "Enough active windows matched the expected raw-to-B1 path"
+
+
+def capture_sample(seconds: float = 8.0) -> dict:
+    """Open two short PCM taps, aggregate features, then close them; never persist audio."""
+    if not 3.0 <= seconds <= 20.0:
+        raise ValueError("sample duration must be between 3 and 20 seconds")
+
+    processes: dict[str, subprocess.Popen[bytes]] = {}
+    buffers = {RAW_SOURCE: bytearray(), PROCESSED_SOURCE: bytearray()}
+    selector = selectors.DefaultSelector()
+    raw_levels: list[float] = []
+    post_levels: list[float] = []
+    correlations: list[float] = []
+    active_windows = valid_windows = candidate_windows = dropout_windows = 0
+    tracker = QualityTracker()
+    fault_confirmed = False
+    start = time.monotonic()
+    capture_error: str | None = None
+
+    def start_one(device: str) -> None:
+        proc = _start_capture(device, f"scheduled-{int(time.time())}-{device}")
+        if proc.stdout is None:
+            raise RuntimeError(f"parec did not provide stdout for {device}")
+        processes[device] = proc
+        selector.register(proc.stdout, selectors.EVENT_READ, device)
+
+    try:
+        start_one(RAW_SOURCE)
+        start_one(PROCESSED_SOURCE)
+        deadline = start + seconds
+        while time.monotonic() < deadline:
+            ready = selector.select(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+            for key, _ in ready:
+                device = key.data
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    buffers[device].extend(chunk)
+                    max_bytes = BLOCK_FRAMES * SAMPLE_BYTES * MAX_CAPTURE_BUFFER_BLOCKS
+                    if len(buffers[device]) > max_bytes:
+                        excess = len(buffers[device]) - max_bytes
+                        excess -= excess % SAMPLE_BYTES
+                        del buffers[device][:excess]
+                else:
+                    capture_error = f"{device} capture stream ended"
+                    break
+            if capture_error:
+                break
+            if any(proc.poll() is not None for proc in processes.values()):
+                capture_error = "a microphone capture process exited"
+                break
+            for raw, processed in _drain_aligned_blocks(buffers, BLOCK_FRAMES):
+                result = analyze_pair(raw, processed)
+                raw_rms = float(result.get("raw_rms", 0.0))
+                post_rms = float(result.get("post_rms", 0.0))
+                correlation = float(result.get("correlation", 0.0))
+                raw_levels.append(raw_rms)
+                post_levels.append(post_rms)
+                correlations.append(correlation)
+                if raw_rms >= RAW_ACTIVITY_RMS_FLOOR:
+                    active_windows += 1
+                if bool(result.get("valid")):
+                    valid_windows += 1
+                if bool(result.get("candidate")):
+                    candidate_windows += 1
+                if bool(result.get("dropout")):
+                    dropout_windows += 1
+                if tracker.observe(result, time.monotonic()):
+                    fault_confirmed = True
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        capture_error = str(exc)
+    finally:
+        for proc in processes.values():
+            try:
+                if proc.stdout is not None:
+                    selector.unregister(proc.stdout)
+            except Exception:
+                pass
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        for proc in processes.values():
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        selector.close()
+
+    summary = {
+        "sample_seconds": round(time.monotonic() - start, 2),
+        "windows": len(raw_levels),
+        "active_windows": active_windows,
+        "valid_windows": valid_windows,
+        "candidate_windows": candidate_windows,
+        "dropout_windows": dropout_windows,
+        "fault_confirmed": fault_confirmed,
+        "raw_rms_p50": _percentile(raw_levels, 0.50),
+        "raw_rms_p90": _percentile(raw_levels, 0.90),
+        "raw_rms_p99": _percentile(raw_levels, 0.99),
+        "post_rms_p50": _percentile(post_levels, 0.50),
+        "post_rms_p90": _percentile(post_levels, 0.90),
+        "post_rms_p99": _percentile(post_levels, 0.99),
+        "correlation_p50": _percentile(correlations, 0.50),
+        "capture_error": capture_error,
+    }
+    verdict, reason = classify_sample(summary)
+    if capture_error:
+        verdict, reason = "INCONCLUSIVE", f"Capture could not complete: {capture_error}"
+    summary["verdict"] = verdict
+    summary["reason"] = reason
+    return summary
+
+
+def _record_sample(summary: dict, *, path: pathlib.Path = SAMPLE_HISTORY_PATH) -> None:
+    """Persist bounded numeric summaries only; history never contains audio samples."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **summary}
+    try:
+        previous = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    except OSError:
+        previous = []
+    lines = (previous + [json.dumps(record, sort_keys=True)])[-256:]
+    temp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
+def run_sample_cycle(seconds: float, config: dict[str, bool]) -> int:
+    """Sample once; on a confirmed fault restart at most once, then sample once again."""
+    state = _read_state()
+    # A previous verification result belongs only to its own cycle.
+    state.pop("last_recheck", None)
+    state.pop("last_recheck_at", None)
+    first = capture_sample(seconds)
+    LOG.info(
+        "B1 audio verdict: %s (%s); windows=%d active=%d valid=%d clicks=%d dropouts=%d "
+        "raw_p50=%s raw_p90=%s post_p50=%s post_p90=%s corr_p50=%s",
+        first["verdict"], first["reason"], first["windows"], first["active_windows"],
+        first["valid_windows"], first["candidate_windows"], first["dropout_windows"],
+        first["raw_rms_p50"], first["raw_rms_p90"], first["post_rms_p50"],
+        first["post_rms_p90"], first["correlation_p50"],
+    )
+    state["last_sample"] = first
+    state["last_sample_at"] = time.time()
+
+    if first["verdict"] == "INCORRECT":
+        if config.get("AUTO_RECOVER", False):
+            recovered, detail = handle_confirmed_fault(config, state)
+            if recovered:
+                LOG.warning("B1 sample incorrect; %s; running one verification sample", detail)
+                second = capture_sample(seconds)
+                state = _read_state()
+                state["last_recheck"] = second
+                state["last_recheck_at"] = time.time()
+                if second["verdict"] == "CORRECT":
+                    state["last_verdict"] = "RECOVERED"
+                    message = f"{detail}. Verification sample is correct."
+                    LOG.warning("B1 recovery verified: %s", message)
+                    if config.get("NOTIFY", True):
+                        notify("B1 microphone recovered", message, urgency="normal")
+                else:
+                    state["last_verdict"] = "STILL_INCORRECT" if second["verdict"] == "INCORRECT" else "RECHECK_INCONCLUSIVE"
+                    message = f"{detail}. Verification result: {second['verdict']} - {second['reason']}"
+                    LOG.error("B1 recovery verification: %s", message)
+                    if config.get("NOTIFY", True):
+                        notify("B1 microphone needs attention", message, urgency="critical")
+            else:
+                state["last_verdict"] = "INCORRECT_RECOVERY_REFUSED"
+                message = f"Fault confirmed, but recovery was refused: {detail}"
+                LOG.error(message)
+                if config.get("NOTIFY", True):
+                    notify("B1 microphone fault detected", message, urgency="critical")
+        else:
+            state["last_verdict"] = "INCORRECT_RECOVERY_DISABLED"
+            LOG.error("B1 fault confirmed, but AUTO_RECOVER=0: %s", first["reason"])
+            if config.get("NOTIFY", True):
+                notify("B1 microphone fault detected", "Fault confirmed. Automatic Carla recovery is disabled.", urgency="critical")
+    else:
+        state["last_verdict"] = first["verdict"]
+        if first["verdict"] in {"SUSPECT", "INCONCLUSIVE"} and config.get("NOTIFY", True):
+            LOG.info("No Carla restart: sample did not meet the confirmed-fault threshold")
+
+    state["last_sample"] = first
+    state["last_sample_at"] = time.time()
+    _write_state(state)
+    _record_sample(first)
+    if isinstance(state.get("last_recheck"), dict):
+        _record_sample({"phase": "post_restart_verification", **state["last_recheck"]})
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="print detected Carla process and B1 graph state")
+    parser.add_argument("--status", action="store_true", help="print the last intermittent sample verdict")
+    parser.add_argument("--sample-seconds", type=float, metavar="SECONDS", help="run one bounded sample, then exit")
+    parser.add_argument("--continuous", action="store_true", help="run the legacy continuous observer for manual diagnostics only")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.check:
@@ -799,6 +1025,14 @@ def main() -> int:
             "auto_recover": load_config()["AUTO_RECOVER"],
         }, indent=2))
         return 0
+    if args.status:
+        print(json.dumps(_read_state(), indent=2))
+        return 0
+    if args.sample_seconds is not None:
+        return run_sample_cycle(args.sample_seconds, load_config())
+    if not args.continuous:
+        parser.print_help()
+        return 2
     stopped = False
 
     def request_stop(_signum: int, _frame: object) -> None:

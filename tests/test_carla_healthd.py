@@ -57,6 +57,28 @@ class CarlaQualityAnalysisTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["candidate"])
 
+    def test_measured_level_clean_speech_remains_valid(self):
+        raw = [sample * 0.01 for sample in speech_like()]
+        processed = [sample * 8.0 for sample in raw]
+        result = health.analyze_pair(raw, processed)
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["candidate"])
+
+    def test_measured_level_dropout_requires_sustained_loud_input(self):
+        raw = [sample * 0.02 for sample in speech_like()]
+        with patch.object(health, "_b1_expected_active", return_value=True):
+            result = health.analyze_pair(raw, [0.0] * len(raw))
+        self.assertTrue(result["dropout"])
+
+    def test_measured_level_output_only_click_is_detected(self):
+        raw = [sample * 0.01 for sample in speech_like()]
+        processed = [sample * 8.0 for sample in raw]
+        for index in range(2100, 2124):
+            processed[index] += 0.08
+        result = health.analyze_pair(raw, processed)
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["candidate"])
+
     def test_raw_speech_transient_does_not_look_like_output_only_crackle(self):
         raw = speech_like()
         for index in range(2100, 2124):
@@ -125,6 +147,86 @@ class CarlaQualityAnalysisTests(unittest.TestCase):
         self.assertFalse(tracker.observe(dropout, 1.0))
         self.assertFalse(tracker.observe(dropout, 1.1))
         self.assertTrue(tracker.observe(dropout, 1.2))
+
+
+class CarlaIntermittentCycleTests(unittest.TestCase):
+    def test_confirmed_fault_restarts_once_and_verifies_once(self):
+        incorrect = {
+            "verdict": "INCORRECT", "reason": "confirmed fault", "windows": 80,
+            "active_windows": 40, "valid_windows": 20, "candidate_windows": 3,
+            "dropout_windows": 0, "raw_rms_p50": 0.001, "raw_rms_p90": 0.002,
+            "post_rms_p50": 0.008, "post_rms_p90": 0.01, "correlation_p50": 0.7,
+        }
+        correct = {
+            "verdict": "CORRECT", "reason": "clean", "windows": 80,
+            "active_windows": 40, "valid_windows": 38, "candidate_windows": 0,
+            "dropout_windows": 0, "raw_rms_p50": 0.001, "raw_rms_p90": 0.002,
+            "post_rms_p50": 0.008, "post_rms_p90": 0.01, "correlation_p50": 0.8,
+        }
+        stored = {}
+        with patch.object(health, "capture_sample", side_effect=[incorrect, correct]) as sample, \
+             patch.object(health, "_read_state", side_effect=[{}, {}]), \
+             patch.object(health, "handle_confirmed_fault", return_value=(True, "Carla restarted")) as restart, \
+             patch.object(health, "_write_state", side_effect=lambda value: stored.update(value)), \
+             patch.object(health, "_record_sample"), patch.object(health, "notify"):
+            code = health.run_sample_cycle(8.0, {"AUTO_RECOVER": True, "NOTIFY": True})
+        self.assertEqual(code, 0)
+        self.assertEqual(sample.call_count, 2)
+        restart.assert_called_once()
+        self.assertEqual(stored["last_verdict"], "RECOVERED")
+        self.assertEqual(stored["last_recheck"]["verdict"], "CORRECT")
+
+    def test_no_sample_never_restarts_carla(self):
+        no_sample = {
+            "verdict": "NO_SAMPLE", "reason": "quiet", "windows": 80,
+            "active_windows": 0, "valid_windows": 0, "candidate_windows": 0,
+            "dropout_windows": 0, "raw_rms_p50": 0.00005, "raw_rms_p90": 0.0001,
+            "post_rms_p50": 0.001, "post_rms_p90": 0.0012, "correlation_p50": 0.7,
+        }
+        stored = {}
+        with patch.object(health, "capture_sample", return_value=no_sample), \
+             patch.object(health, "_read_state", return_value={}), \
+             patch.object(health, "handle_confirmed_fault") as restart, \
+             patch.object(health, "_write_state", side_effect=lambda value: stored.update(value)), \
+             patch.object(health, "_record_sample"):
+            code = health.run_sample_cycle(8.0, {"AUTO_RECOVER": True, "NOTIFY": True})
+        self.assertEqual(code, 0)
+        restart.assert_not_called()
+        self.assertEqual(stored["last_verdict"], "NO_SAMPLE")
+
+
+class CarlaIntermittentVerdictTests(unittest.TestCase):
+    def test_quiet_sample_is_no_sample_and_never_a_fault(self):
+        verdict, _ = health.classify_sample({
+            "fault_confirmed": False, "active_windows": 0, "valid_windows": 0,
+            "candidate_windows": 0, "dropout_windows": 0,
+        })
+        self.assertEqual(verdict, "NO_SAMPLE")
+
+    def test_clean_active_correlated_sample_is_correct(self):
+        verdict, _ = health.classify_sample({
+            "fault_confirmed": False, "active_windows": 10, "valid_windows": 9,
+            "candidate_windows": 0, "dropout_windows": 0,
+        })
+        self.assertEqual(verdict, "CORRECT")
+
+    def test_isolated_candidate_is_suspect_not_a_restart_fault(self):
+        verdict, _ = health.classify_sample({
+            "fault_confirmed": False, "active_windows": 10, "valid_windows": 10,
+            "candidate_windows": 1, "dropout_windows": 0,
+        })
+        self.assertEqual(verdict, "SUSPECT")
+
+    def test_only_confirmed_repeated_fault_is_incorrect(self):
+        verdict, _ = health.classify_sample({
+            "fault_confirmed": True, "active_windows": 10, "valid_windows": 4,
+            "candidate_windows": 3, "dropout_windows": 0,
+        })
+        self.assertEqual(verdict, "INCORRECT")
+
+    def test_raw_activity_floor_matches_measured_source_scale(self):
+        self.assertAlmostEqual(health.RAW_ACTIVITY_RMS_FLOOR, 0.00025)
+        self.assertLess(health.RAW_ACTIVITY_RMS_FLOOR, 0.001153)
 
 
 class CarlaHealthSafetyTests(unittest.TestCase):
@@ -422,22 +524,28 @@ if load_bus_state; then printf '%s %s' "$B1_PROCESSED" "$B2_PROCESSED"; else ech
 
 
 class CarlaHealthDeploymentTests(unittest.TestCase):
-    def test_health_unit_is_notification_only_by_default_and_bounded(self):
+    def test_health_unit_is_bounded_oneshot_with_no_persistent_capture(self):
         unit = (ROOT / "User/roaring-carla-healthd.service").read_text()
-        self.assertIn("ExecStart=%h/bin/roaring_carla_healthd.py", unit)
+        self.assertIn("Type=oneshot", unit)
+        self.assertIn("ExecStart=%h/bin/roaring_carla_healthd.py --sample-seconds 8", unit)
         self.assertIn("CPUQuota=15%", unit)
-        self.assertIn("MemoryMax=160M", unit)
+        self.assertIn("MemoryMax=96M", unit)
+        self.assertIn("TimeoutStartSec=180", unit)
+        self.assertNotIn("Restart=on-failure", unit)
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("ReadWritePaths=-%h/.cache/roaring", unit)
 
-    def test_installer_does_not_enable_observer_unless_explicit_flag(self):
+    def test_health_timer_runs_infrequently_and_only_when_enabled(self):
+        timer = (ROOT / "User/roaring-carla-healthd.timer").read_text()
+        self.assertIn("OnBootSec=3min", timer)
+        self.assertIn("OnUnitActiveSec=10min", timer)
+        self.assertIn("RandomizedDelaySec=45s", timer)
         installer = (ROOT / "Bin/install_roaring_carla_healthd.sh").read_text()
-        self.assertIn("--enable-observer", installer)
-        self.assertIn("AUTO_RECOVER=1", installer)
-        self.assertIn('if (( enable_observer )); then', installer)
+        self.assertIn("--enable-sampler", installer)
+        self.assertIn('if (( enable_sampler )); then', installer)
+        self.assertIn("disable --now roaring-carla-healthd.service", installer)
         self.assertIn("install -m 0600", installer)
         self.assertIn("daemon-reload", installer)
-
 
 class PipeWireClockMetadataTests(unittest.TestCase):
     def test_zero_force_rate_falls_back_to_normal_clock_rate(self):

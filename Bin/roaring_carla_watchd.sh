@@ -4,7 +4,7 @@
 # export on this machine contains malformed video-format metadata.
 set -euo pipefail
 
-POLL="${CARLA_WATCH_POLL:-3}"
+POLL="${CARLA_WATCH_POLL:-10}"
 ROUTER_CONF="${ROARING_MIC_ROUTER_CONF:-$HOME/.config/hearth/roaring_mic_router.conf}"
 B1_PROCESSED=0
 B2_PROCESSED=0

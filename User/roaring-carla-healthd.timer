@@ -1,0 +1,13 @@
+[Unit]
+Description=Run a short B1 audio quality sample every ten minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=45s
+AccuracySec=1min
+Persistent=true
+Unit=roaring-carla-healthd.service
+
+[Install]
+WantedBy=timers.target

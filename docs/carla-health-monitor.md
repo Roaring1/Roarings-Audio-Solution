@@ -1,110 +1,135 @@
-# Carla B1 health observer
+# Intermittent Carla B1 audio check
 
-## Scope
+## Operating model
 
-The observer monitors the processed B1 microphone path:
+The quality sampler is NOT a daemon. A user systemd timer starts an 8-second
+oneshot check approximately every 10 minutes. The service exits after each
+sample and closes both parec microphone taps. Between runs it captures no
+microphone audio and consumes no sampler CPU or memory.
 
-`sm7b_mono -> Carla -> mic_b1 -> b1_mic`
+Files:
 
-It opens two short in-memory PCM taps, compares 100 ms windows, and records feature metrics only. Audio samples are not written to disk, uploaded, or included in notifications. Capture buffers are capped at six analysis blocks per tap. The analysis dependency is NumPy; no SciPy is required.
+- User/roaring-carla-healthd.service - bounded 8-second oneshot sampler.
+- User/roaring-carla-healthd.timer - starts it after login/boot and then at
+  10-minute intervals with up to 45 seconds of jitter.
+- Bin/roaring_carla_healthd.py - short in-memory sampling, classification,
+  numeric history and guarded restart/recheck.
+- ~/.cache/roaring/carla-health-history.jsonl - last 256 numeric summaries;
+  no PCM, transcriptions, or audio payloads.
+- ~/.cache/roaring/carla-healthd-state.json - latest verdict and restart
+  circuit-breaker state.
 
-The comparison estimates the pre/post delay, fits a local gain, then checks the residual for output-only high-frequency impulses. It separately detects a loud raw-input / silent-processed dropout, but only when the Hearth router says B1 and Carla-to-B1 are enabled and the B1 sink is unmuted. A single transient is ignored; three events in four seconds or three consecutive dropout windows are required to confirm a candidate.
+The separate roaring-carla-watchd.service is a routing maintainer, not an
+audio sampler. It checks the PipeWire graph every few seconds and restores
+only links authorized by the Hearth router configuration. It stays active so
+a Carla restart can regain its B1 links; it does not open microphone capture
+taps or write audio.
 
-This is an initial conservative heuristic, not yet a calibrated human-perception classifier. The synthetic test suite covers clean/processed speech, input-side transients, output-only clicks, dropouts, and silence. It still needs a live voiced-speech soak and a controlled diagnostic capture during a real crackle incident before automatic restart should be enabled.
+## Verdicts
 
-## Runtime diagnostics
+Each sample compares aligned 100 ms windows from:
 
-Every 30 seconds it samples:
+sm7b_mono -> Carla -> mic_b1 -> b1_mic
 
-- PipeWire `pw-top` node states and ERR counters for Scarlett capture, Carla, and B1.
-- The effective `clock.force-quantum` / `clock.quantum` and graph rate.
-- Aligned raw/post audio quality features.
+The comparison uses normalized correlation, output-only high-frequency
+transients, and input-present/output-missing dropout evidence.
 
-The ERR field is cumulative xruns plus errors, not a direct acoustic-quality measurement. The observer alerts only on counter increases after its own baseline. The existing Moonlight sender remains the owner of graph-quantum escalation; this observer does not compete with it.
+- CORRECT - enough active raw-input windows, with at least 60% valid
+  raw-to-processed correspondence and no detected quality events.
+- NO_SAMPLE - insufficient microphone activity. No restart is attempted.
+- INCONCLUSIVE - activity exists but too few windows are comparable. No
+  restart is attempted.
+- SUSPECT - an isolated transient/dropout candidate occurred but did not
+  meet the repeated-fault threshold. No restart is attempted.
+- INCORRECT - three output-only impulse candidates within four seconds, or
+  three consecutive dropout windows, confirm a fault.
 
-## Safe recovery
+The initial raw activity floor is 0.00025, derived from a short live numeric
+survey on this machine (quiet median 0.000057; 99th percentile 0.001153).
+The dropout gate is 0.0012 raw RMS and additionally requires a very quiet
+processed path. These are initial deployment thresholds, not a final
+human-perception classifier. Numeric history is retained so subsequent
+intermittent samples can refine them. Quiet windows are never treated as proof
+of a fault.
 
-Carla recovery is deliberately disabled by default:
+## Recovery behavior
 
-`~/.config/roaring/carla-health.env`
+AUTO_RECOVER=1 enables recovery only after a high-confidence INCORRECT
+verdict. A confirmed fault causes at most one guarded Carla restart, followed
+by exactly one fresh 8-second verification sample:
 
-```ini
-AUTO_RECOVER=0
-NOTIFY=1
-```
+- RECOVERED - the verification sample is CORRECT.
+- STILL_INCORRECT - a second fault is confirmed; it does not trigger another
+  restart in the same cycle.
+- RECHECK_INCONCLUSIVE - the post-restart sample lacks enough activity or
+  cannot establish a clean path. No additional restart is attempted.
 
-When enabled, recovery requires all of the following:
+Restart safety checks remain mandatory: B1 must be enabled and unmuted; exactly
+one known headless Carla backend must exist; the canonical session unit must
+be installed; the old backend must be proven gone before replacement start;
+and the Carla node plus all four B1 links must return. Restart attempts are
+limited to one per 15 minutes and two per hour. Unknown or multiple Carla
+owners fail closed.
 
-- Confirmed repeated audio-quality fault, not a single click.
-- Exactly one known Carla backend process.
-- Carla is headless; interactive editing sessions are never interrupted.
-- B1 is active, Carla-to-B1 is enabled, and B1 is not muted.
-- The canonical `roaring-carla-session.service` is installed.
+NOTIFY=1 sends notifications for confirmed faults/recovery outcomes. Routine
+CORRECT results are logged and stored, not announced every 10 minutes.
+NO_SAMPLE, INCONCLUSIVE, and SUSPECT never cause a restart.
 
-Recovery stops the canonical wrapper and the known transient B1 restart unit, stops the Flatpak app, proves the backend process has exited, then starts the canonical service. It waits for Carla's PipeWire node and verifies the four B1 input/output links before reporting success. Unknown or multiple Carla owners fail closed. Failed attempts count toward the same persistent cooldown: 15 minutes between attempts and at most two attempts per hour.
+## Installation and operation
 
-The existing patch watcher uses `pw-link -l`, not strict `pw-dump` JSON parsing. It only adds a link after a successful graph query confirms that exact connection is absent. An unavailable or ambiguous graph fails closed.
+From the repository root, run:
 
-## Install and validate
+    Bin/install_roaring_carla_healthd.sh --enable-sampler
 
-On Nobara/Fedora, install NumPy if needed:
+This installs the service and timer, stops/disables any legacy continuous
+healthd service, and enables the intermittent timer. It does not restart Carla
+during installation.
 
-`sudo dnf install python3-numpy`
+Check the timer and last verdict:
 
-From the repository root:
+    systemctl --user status roaring-carla-healthd.timer
+    systemctl --user list-timers roaring-carla-healthd.timer
+    ~/bin/roaring_carla_healthd.py --status
+    journalctl --user -u roaring-carla-healthd.service -n 40
 
-`Bin/install_roaring_carla_healthd.sh`
+Run one immediate sample manually:
 
-This installs the observer, repaired watcher, and user service unit, creates a notification-only config if one does not already exist, and reloads user systemd. It does not start or enable the observer and does not restart Carla.
+    systemctl --user start roaring-carla-healthd.service
 
-To activate only the repaired patch watcher after verifying the patchbay parser:
+Pause all microphone sampling:
 
-`Bin/install_roaring_carla_healthd.sh --restart-watcher`
+    systemctl --user disable --now roaring-carla-healthd.timer
 
-To start the observer in notification-only mode:
+The unit has a 15% CPU quota, 96 MiB memory cap, low scheduling priority and
+a bounded runtime. No microphone tap remains open between samples. The
+legacy continuous mode exists only for explicit manual diagnostics:
+roaring_carla_healthd.py --continuous; it is not used by systemd.
 
-`Bin/install_roaring_carla_healthd.sh --enable-observer`
+## Current rollout notes
 
-Only after real voiced-speech validation should `AUTO_RECOVER=1` be set and the health observer restarted. This setting is separate from enabling the service.
+- AUTO_RECOVER=1 is enabled for the intermittent timer only. Recovery is
+  reached exclusively after the repeated-fault classifier gate, then followed
+  by one verification sample.
+- Existing live checks show one Carla backend, expected B1 links, 48 kHz /
+  512-frame graph, Scarlett ERR=15, B1 ERR=1, Carla ERR=0. These are cumulative
+  PipeWire counters; no new increments were observed in the last check.
+- The previous always-running observer consumed about 2-3% CPU and held two
+  microphone taps open continuously. That continuous service has been retired.
+- The remaining validation is acoustic: collect enough numeric samples during
+  clean speech, phone audio, and quiet periods; then compare controlled
+  output-only clicks/dropouts with the detector. Do not loosen the confirmed
+  fault gates from a single isolated sample.
+- No raw microphone audio is written to disk or retained between sample runs.
 
-Useful checks:
+## Detector research
 
-`systemctl --user status roaring-carla-healthd.service`
+The current residual impulse heuristic is a conservative first stage, not a
+validated perceptual classifier. Candidate improvements should be evaluated
+against human-labelled clean and faulty samples, including plosives, sibilants,
+phone playback, and controlled 0.1-1 ms clicks.
 
-`journalctl --user -u roaring-carla-healthd.service -f`
-
-`~/bin/roaring_carla_healthd.py --check`
-
-The health observer never launches a second Carla process. Do not manually start a second Carla engine or the canonical session while a transient Flatpak Carla backend remains alive.
-
-## Current rollout caution (2026-11-09)
-
-The patch watcher has been installed and restarted. It now follows the Hearth router's B1_ACTIVE / CARLA_TO_B1 and B2_ACTIVE / CARLA_TO_B2 flags; the live config is B1 processed, B2 not processed. The four expected B1 links were verified present and both B2 Carla output links were verified absent. The watcher does not depend on the strict graph JSON parser.
-
-The observer unit and script are installed, but the unit remains **disabled and stopped**. Its config remains AUTO_RECOVER=0, NOTIFY=1.
-
-A temporary live test opened both PCM taps using a 20 ms requested latency. Approximately four seconds later the Scarlett cumulative ERR counter increased from 14 to 15; the existing Moonlight xrun watchdog reacted by raising the graph quantum from 512 to 1024 frames and persisted 1024 as the safe quantum. The timing is concerning, but does not prove the additional xrun was caused by the observer. The observer was stopped immediately. No Carla restart was attempted.
-
-Follow-up code changes reduced the requested tap latency to 10 ms, aligned more closely to one 512-frame graph period, and changed the capture loop to drain every complete paired analysis block instead of allowing a backlog to accumulate. The revised version passes the synthetic and existing regression suites, but **has not yet had a second live acoustic trial**. Keep the observer stopped until a controlled trial confirms it does not increase Scarlett ERR. Do not enable automatic Carla recovery until both live capture safety and crackle-detection sensitivity/false-positive behavior have been validated with real voiced speech and known fault examples.
-
-At the last check the graph was 48 kHz / 1024 frames, the persisted safe quantum was 1024, and the observer had no capture clients open. Do not force the graph back to 512 as part of this work; let the existing xrun policy manage any future downshift.
-
-
-## Live deployment check - November 9, 2026
-
-The repaired patch watcher was installed and restarted successfully. It reads the existing Hearth route configuration and currently confirms B1 enabled / B2 disabled. The four B1 links are present; the two B2 output links remain absent, as configured. This prevents the old default-on B2 patch watcher from racing the router.
-
-The health observer was temporarily started (not enabled at login) with `AUTO_RECOVER=0`. Both `parec` taps connected. After the first buffer-draining revision, the initial backlog warnings did not recur. During a 30-second idle soak, the Scarlett error counter remained at 15, Carla at 0, and B1 at 1. Those are cumulative counters, not new errors during the soak. The graph remained at 512 frames / 48 kHz. The observer used about 52 MiB RSS and approximately 2-3% CPU in the idle snapshot. No audio PCM was written to disk.
-
-The initial 14 -> 15 Scarlett counter increase happened near observer startup; the short subsequent soak was flat. This does not prove the observer caused that single increment, but longer observation during normal voice use is needed to establish that the taps are non-disruptive.
-
-The observer has not yet seen a live voiced-speech test. Idle raw SM7B level is below the detector's voice floor, so the crackle classifier has not been calibrated against a real utterance in this runtime. Notifications for new PipeWire ERR deltas are implemented; automatic Carla restart remains disabled. Do not enable `AUTO_RECOVER=1` until clean voiced speech and a controlled crackle/reference pair have been tested end-to-end.
-
-## Detector research and next calibration pass
-
-The current live heuristic is intentionally a conservative first stage, not a final perceptual crackle classifier. The next comparison should retain the raw-vs-processed residual path and evaluate at least two impulse detectors against human-labelled voiced speech:
-
-- Essentia's streaming ClickDetector implements frame-wise LPC inverse filtering, matched filtering, and a robust threshold based on the excitation-noise estimate. Its documentation also describes skipping silence because low-level false detections may be inaudible: https://essentia.upf.edu/reference/std_ClickDetector.html
-- Rund et al.'s 2025 open-access comparison of eight perceptible impulsive-noise detectors found the ERBlet-transform approach had the strongest average discriminability (A') and low variance; the study also notes that the conventional AR method performed worst among the compared approaches. This supports testing a perceptually motivated ERBlet feature alongside the current residual impulse features rather than relying on a raw derivative or AR score alone: https://link.springer.com/article/10.1186/s13636-024-00389-9
-
-Evaluation should report hit rate, false-alarm rate, precision, and A' across speech level, plosives, sibilants, vowel transitions, and injected 0.1-1 ms clicks. Thresholds must be tuned on held-out audio, not on the same clips used for calibration.
+References:
+- Essentia ClickDetector documentation:
+  https://essentia.upf.edu/reference/std_ClickDetector.html
+- Rund et al. (2025), comparison of perceptible impulsive-noise detectors:
+  https://link.springer.com/article/10.1186/s13636-024-00389-9
