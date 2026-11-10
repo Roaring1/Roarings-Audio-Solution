@@ -99,3 +99,12 @@ The health observer was temporarily started (not enabled at login) with `AUTO_RE
 The initial 14 -> 15 Scarlett counter increase happened near observer startup; the short subsequent soak was flat. This does not prove the observer caused that single increment, but longer observation during normal voice use is needed to establish that the taps are non-disruptive.
 
 The observer has not yet seen a live voiced-speech test. Idle raw SM7B level is below the detector's voice floor, so the crackle classifier has not been calibrated against a real utterance in this runtime. Notifications for new PipeWire ERR deltas are implemented; automatic Carla restart remains disabled. Do not enable `AUTO_RECOVER=1` until clean voiced speech and a controlled crackle/reference pair have been tested end-to-end.
+
+## Detector research and next calibration pass
+
+The current live heuristic is intentionally a conservative first stage, not a final perceptual crackle classifier. The next comparison should retain the raw-vs-processed residual path and evaluate at least two impulse detectors against human-labelled voiced speech:
+
+- Essentia's streaming ClickDetector implements frame-wise LPC inverse filtering, matched filtering, and a robust threshold based on the excitation-noise estimate. Its documentation also describes skipping silence because low-level false detections may be inaudible: https://essentia.upf.edu/reference/std_ClickDetector.html
+- Rund et al.'s 2025 open-access comparison of eight perceptible impulsive-noise detectors found the ERBlet-transform approach had the strongest average discriminability (A') and low variance; the study also notes that the conventional AR method performed worst among the compared approaches. This supports testing a perceptually motivated ERBlet feature alongside the current residual impulse features rather than relying on a raw derivative or AR score alone: https://link.springer.com/article/10.1186/s13636-024-00389-9
+
+Evaluation should report hit rate, false-alarm rate, precision, and A' across speech level, plosives, sibilants, vowel transitions, and injected 0.1-1 ms clicks. Thresholds must be tuned on held-out audio, not on the same clips used for calibration.
