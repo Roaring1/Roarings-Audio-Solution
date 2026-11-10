@@ -637,7 +637,7 @@ class CarlaHealthDeploymentTests(unittest.TestCase):
 
     def test_health_timer_runs_infrequently_and_only_when_enabled(self):
         timer = (ROOT / "User/roaring-carla-healthd.timer").read_text()
-        self.assertIn("OnBootSec=3min", timer)
+        self.assertIn("OnActiveSec=3min", timer)
         self.assertIn("OnUnitActiveSec=10min", timer)
         self.assertIn("RandomizedDelaySec=45s", timer)
         installer = (ROOT / "Bin/install_roaring_carla_healthd.sh").read_text()
