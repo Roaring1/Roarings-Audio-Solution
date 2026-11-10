@@ -13,6 +13,8 @@ class AudioShellSyntaxTests(unittest.TestCase):
             "Bin/roaring_mic_routesd.sh",
             "Bin/roaring_moonlight_micd.sh",
             "Bin/roaring_mic_bussesd.sh",
+            "Bin/roaring_carla_watchd.sh",
+            "Bin/install_roaring_carla_healthd.sh",
         )
         for relative in scripts:
             with self.subTest(script=relative):

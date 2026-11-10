@@ -1,0 +1,23 @@
+[Unit]
+Description=Roaring intermittent Carla B1 audio quality check
+After=graphical-session.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=graphical-session.target pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+ExecStart=%h/bin/roaring_carla_healthd.py --sample-seconds 8
+TimeoutStartSec=180
+Nice=10
+CPUQuota=15%
+MemoryMax=96M
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.cache/roaring -%h/.config/roaring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
