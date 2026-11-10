@@ -508,6 +508,50 @@ class B1ExpectedStateTests(unittest.TestCase):
                 self.assertFalse(health._b1_expected_active())
                 self.assertEqual(run.call_count, 2)
 
+    def test_capture_sample_closes_both_taps_when_user_mutes_mid_sample(self):
+        from unittest.mock import patch
+
+        class FakeStream:
+            def fileno(self):
+                return 10
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdout = FakeStream()
+                self.terminated = False
+                self.waited = False
+            def poll(self):
+                return None
+            def terminate(self):
+                self.terminated = True
+            def wait(self, timeout=None):
+                self.waited = True
+                return 0
+            def kill(self):
+                self.terminated = True
+
+        class FakeSelector:
+            def register(self, *args, **kwargs):
+                pass
+            def unregister(self, *args, **kwargs):
+                pass
+            def select(self, timeout=None):
+                return []
+            def close(self):
+                pass
+
+        processes = [FakeProcess(), FakeProcess()]
+        with patch.object(health, "_b1_expected_active", side_effect=[True, False]), \
+             patch.object(health, "_start_capture", side_effect=processes) as start_capture, \
+             patch.object(health.selectors, "DefaultSelector", return_value=FakeSelector()):
+            result = health.capture_sample(8.0)
+
+        self.assertEqual(start_capture.call_count, 2)
+        self.assertEqual(result["verdict"], "MUTED")
+        self.assertTrue(result["muted"])
+        self.assertEqual(result["windows"], 0)
+        self.assertTrue(all(process.terminated and process.waited for process in processes))
+
     def test_sample_cycle_does_not_open_capture_when_b1_is_muted(self):
         from unittest.mock import patch
         stored = {}
