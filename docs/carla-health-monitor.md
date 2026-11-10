@@ -105,24 +105,29 @@ a bounded runtime. No microphone tap remains open between samples. The
 legacy continuous mode exists only for explicit manual diagnostics:
 roaring_carla_healthd.py --continuous; it is not used by systemd.
 
-## Live pause status - 2026-11-10
+## Mute-aware scheduled sampling - 2026-11-10
 
-The owner is temporarily not using the microphone. The installed sampler has
-therefore been deliberately parked:
+The sampler remains scheduled while the microphone pipeline is in normal use.
+It does not open capture taps when B1 is muted or disabled:
 
-- `roaring-carla-healthd.timer` is disabled and inactive.
-- `roaring-carla-healthd.service` is stopped/inactive; no sample is running.
-- `AUTO_RECOVER=0` in the local runtime config, so manually starting a sample
-  cannot trigger automatic Carla recovery during this break.
-- The installed script, service, timer, numeric history, and state files are
-  retained. No PCM files are created or need cleanup.
-- The separate `roaring-carla-watchd.service` remains active only to maintain
-  Carla patchbay links. It does not open microphone capture taps.
+- Before opening either microphone tap, the sampler checks the Hearth
+  `B1_ACTIVE` and `CARLA_TO_B1` flags, the `mic_b1` sink mute, and the
+  `b1_mic` source mute.
+- Any muted, disabled, missing, or unreadable state fails closed: the run
+  records `MUTED` and exits without starting `parec`.
+- During the 8-second sample, the same gate is rechecked at sub-second
+  intervals. If mute is toggled mid-sample, both capture taps are terminated,
+  the partial sample is discarded, and no recovery action is taken.
+- The `MUTED` result is not an error and does not notify or restart Carla.
+- The timer stays enabled for the normal 10-minute cadence. This keeps the
+  checker ready to resume automatically after B1 is unmuted.
+- `AUTO_RECOVER=0` remains set until Carla process ownership is hardened and
+  actual acoustic acceptance tests are complete.
 
-This is a temporary runtime pause, not a code or configuration deletion.
-When microphone use resumes, inspect current B1 routing and Carla ownership
-first, then explicitly re-enable sampling. Keep automatic recovery disabled
-until the acoustic and process-ownership acceptance tests are complete.
+The ordinary microphone pipeline remains independent of this sampler. The
+Moonlight sender and Vesktop mic mute watchdog are normal-use services; the
+health checker only decides whether it is appropriate to open its own
+temporary diagnostic capture taps.
 
 ## Initial rollout notes - 2026-11-09
 
