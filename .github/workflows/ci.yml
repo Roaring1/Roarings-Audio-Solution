@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install audio observer dependency
+        run: python -m pip install numpy
       - name: Python regression suite
         run: python -m unittest discover -s tests -v
       - name: Compile Python assets
@@ -27,6 +29,8 @@ jobs:
           bash -n Bin/roaring_mic_routesd.sh
           bash -n Bin/roaring_moonlight_micd.sh
           bash -n Bin/roaring_mic_bussesd.sh
+          bash -n Bin/roaring_carla_watchd.sh
+          bash -n Bin/install_roaring_carla_healthd.sh
           bash -n Bin/roaring_carla_launch.sh
           bash -n Bin/roaring_carla_stop_stale.sh
           bash -n Bin/roaring_carla_wait_ready.sh

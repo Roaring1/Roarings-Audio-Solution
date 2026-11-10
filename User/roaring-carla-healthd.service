@@ -1,0 +1,29 @@
+[Unit]
+Description=Roaring Carla signal-quality watchdog (raw SM7B vs processed B1)
+After=graphical-session.target pipewire.service pipewire-pulse.service wireplumber.service
+Wants=graphical-session.target pipewire-pulse.service wireplumber.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+ExecStart=%h/bin/roaring_carla_healthd.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=10
+Nice=5
+CPUQuota=15%
+MemoryMax=160M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.cache/roaring -%h/.config/roaring
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=default.target
