@@ -164,7 +164,8 @@ class CarlaIntermittentCycleTests(unittest.TestCase):
             "post_rms_p50": 0.008, "post_rms_p90": 0.01, "correlation_p50": 0.8,
         }
         stored = {}
-        with patch.object(health, "capture_sample", side_effect=[incorrect, correct]) as sample, \
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "capture_sample", side_effect=[incorrect, correct]) as sample, \
              patch.object(health, "_read_state", side_effect=[{}, {}]), \
              patch.object(health, "handle_confirmed_fault", return_value=(True, "Carla restarted")) as restart, \
              patch.object(health, "_write_state", side_effect=lambda value: stored.update(value)), \
@@ -184,7 +185,8 @@ class CarlaIntermittentCycleTests(unittest.TestCase):
             "post_rms_p50": 0.001, "post_rms_p90": 0.0012, "correlation_p50": 0.7,
         }
         stored = {}
-        with patch.object(health, "capture_sample", return_value=no_sample), \
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "capture_sample", return_value=no_sample), \
              patch.object(health, "_read_state", return_value={}), \
              patch.object(health, "handle_confirmed_fault") as restart, \
              patch.object(health, "_write_state", side_effect=lambda value: stored.update(value)), \
@@ -461,7 +463,7 @@ class B1ExpectedStateTests(unittest.TestCase):
                 run.return_value.stdout = "Mute: no\n"
                 health._B1_ACTIVE_CACHE = (0.0, False)
                 self.assertTrue(health._b1_expected_active())
-                run.assert_called_once()
+                self.assertEqual(run.call_count, 2)
 
     def test_muted_or_disabled_b1_is_not_eligible_for_dropout_detection(self):
         import tempfile
@@ -475,6 +477,60 @@ class B1ExpectedStateTests(unittest.TestCase):
                 self.assertFalse(health._b1_expected_active())
                 run.assert_not_called()
 
+
+    def test_muted_b1_sink_skips_quality_sampling(self):
+        import tempfile
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        with tempfile.TemporaryDirectory() as temp_dir:
+            router_config = pathlib.Path(temp_dir) / "roaring_mic_router.conf"
+            router_config.write_text('B1_ACTIVE="true"\nCARLA_TO_B1="true"\n')
+            with patch.object(health, "ROUTER_CONFIG_PATH", router_config), \
+                 patch.object(health, "_run_checked", return_value=CompletedProcess([], 0, stdout="Mute: yes\n", stderr="")) as run:
+                health._B1_ACTIVE_CACHE = (0.0, False)
+                self.assertFalse(health._b1_expected_active())
+                run.assert_called_once()
+
+    def test_muted_b1_source_skips_quality_sampling(self):
+        import tempfile
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        with tempfile.TemporaryDirectory() as temp_dir:
+            router_config = pathlib.Path(temp_dir) / "roaring_mic_router.conf"
+            router_config.write_text('B1_ACTIVE="true"\nCARLA_TO_B1="true"\n')
+            outputs = [
+                CompletedProcess([], 0, stdout="Mute: no\n", stderr=""),
+                CompletedProcess([], 0, stdout="Mute: yes\n", stderr=""),
+            ]
+            with patch.object(health, "ROUTER_CONFIG_PATH", router_config), \
+                 patch.object(health, "_run_checked", side_effect=outputs) as run:
+                health._B1_ACTIVE_CACHE = (0.0, False)
+                self.assertFalse(health._b1_expected_active())
+                self.assertEqual(run.call_count, 2)
+
+    def test_sample_cycle_does_not_open_capture_when_b1_is_muted(self):
+        from unittest.mock import patch
+        stored = {}
+        with patch.object(health, "_b1_expected_active", return_value=False), \
+             patch.object(health, "capture_sample") as capture, \
+             patch.object(health, "_read_state", return_value={}), \
+             patch.object(health, "_write_state", side_effect=lambda value: stored.update(value)), \
+             patch.object(health, "_record_sample"), \
+             patch.object(health, "notify") as notify:
+            code = health.run_sample_cycle(8.0, {"AUTO_RECOVER": True, "NOTIFY": True})
+        self.assertEqual(code, 0)
+        capture.assert_not_called()
+        notify.assert_not_called()
+        self.assertEqual(stored["last_verdict"], "MUTED")
+        self.assertEqual(stored["last_sample"]["windows"], 0)
+
+    def test_capture_sample_returns_muted_without_opening_taps(self):
+        from unittest.mock import patch
+        with patch.object(health, "_b1_expected_active", return_value=False), \
+             patch.object(health, "_start_capture") as start_capture:
+            result = health.capture_sample(8.0)
+        self.assertEqual(result["verdict"], "MUTED")
+        start_capture.assert_not_called()
 
 class CarlaWatcherRouterAuthorityTests(unittest.TestCase):
     def _load_router_state(self, text):
