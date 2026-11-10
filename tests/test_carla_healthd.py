@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "Bin"))
@@ -162,8 +163,6 @@ class CarlaHealthSafetyTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class CarlaPatchWatcherTests(unittest.TestCase):
@@ -524,3 +523,150 @@ class QualityTrackerLatchTests(unittest.TestCase):
         self.assertTrue(tracker.latched)
         tracker.observe(clean, 45.0)
         self.assertFalse(tracker.latched)
+
+
+class CarlaSafeRestartSequenceTests(unittest.TestCase):
+    def _backend(self, pid=321, gui=False):
+        argv = ["/usr/bin/python3", "/app/share/carla/carla"]
+        if not gui:
+            argv.append("--no-gui")
+        argv.append("/home/test/CarlaProject.carxp")
+        return (pid, argv, "0::/user.slice/test-carla.scope")
+
+    def _completed(self, args, returncode=0, stdout=""):
+        return subprocess.CompletedProcess(args, returncode, stdout=stdout, stderr="")
+
+    def test_successful_restart_proves_old_backend_gone_before_starting_canonical(self):
+        old_alive = {"value": True}
+        events = []
+        wait_index = {"value": 0}
+        process = self._backend()
+
+        def processes():
+            return [process] if old_alive["value"] else []
+
+        def run_checked(args, timeout=15.0):
+            events.append(("command", tuple(args)))
+            if args[:2] == ["flatpak", "kill"]:
+                old_alive["value"] = False
+            if args[:4] == ["systemctl", "--user", "show", health.CANONICAL_SERVICE]:
+                return self._completed(args, stdout="LoadState=loaded\nActiveState=inactive\n")
+            return self._completed(args)
+
+        def wait_until(predicate, timeout, interval=1.0):
+            index = wait_index["value"]
+            wait_index["value"] += 1
+            value = predicate()
+            events.append(("wait", index, value))
+            return value
+
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", side_effect=processes), \
+             patch.object(health, "_run_checked", side_effect=run_checked), \
+             patch.object(health, "_wait_until", side_effect=wait_until), \
+             patch.object(health, "_carla_node_present", return_value=True), \
+             patch.object(health, "_required_b1_links_present", return_value=True):
+            ok, detail = health.restart_carla_safely()
+
+        self.assertTrue(ok, detail)
+        commands = [event[1] for event in events if event[0] == "command"]
+        flatpak_index = next(i for i, args in enumerate(commands) if args[:2] == ("flatpak", "kill"))
+        start_index = next(i for i, args in enumerate(commands) if args[:3] == ("systemctl", "--user", "start"))
+        first_wait = next(i for i, event in enumerate(events) if event[:2] == ("wait", 0))
+        start_event = next(i for i, event in enumerate(events) if event[0] == "command" and event[1][:3] == ("systemctl", "--user", "start"))
+        self.assertLess(next(i for i, event in enumerate(events) if event[0] == "command" and event[1][:2] == ("flatpak", "kill")), first_wait)
+        self.assertLess(first_wait, start_event)
+        self.assertEqual(commands[start_index][:4], ("systemctl", "--user", "start", health.CANONICAL_SERVICE))
+        self.assertEqual(wait_index["value"], 3)
+        self.assertIn("B1 links verified", detail)
+
+    def test_disabled_or_muted_b1_refuses_recovery_before_inspecting_processes(self):
+        with patch.object(health, "_b1_expected_active", return_value=False), \
+             patch.object(health, "_carla_processes") as processes, \
+             patch.object(health, "_run_checked") as run:
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("disabled or muted", detail)
+        processes.assert_not_called()
+        run.assert_not_called()
+
+    def test_multiple_backends_refuse_recovery_without_any_stop_command(self):
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend(321), self._backend(322)]), \
+             patch.object(health, "_run_checked") as run:
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("found 2", detail)
+        run.assert_not_called()
+
+    def test_interactive_carla_session_is_never_stopped(self):
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend(gui=True)]), \
+             patch.object(health, "_run_checked") as run:
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("editing session", detail)
+        run.assert_not_called()
+
+    def test_uninstalled_canonical_unit_refuses_before_stopping_anything(self):
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend()]), \
+             patch.object(health, "_run_checked", return_value=self._completed([], stdout="LoadState=not-found\n")) as run:
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("not installed", detail)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:4], ["systemctl", "--user", "show", health.CANONICAL_SERVICE])
+
+    def test_canonical_stop_failure_prevents_transient_or_flatpak_kill(self):
+        def run_checked(args, timeout=15.0):
+            if args[:3] == ["systemctl", "--user", "stop"] and args[3] == health.CANONICAL_SERVICE:
+                return self._completed(args, returncode=1)
+            if args[:3] == ["systemctl", "--user", "show"]:
+                return self._completed(args, stdout="LoadState=loaded\n")
+            return self._completed(args)
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend()]), \
+             patch.object(health, "_run_checked", side_effect=run_checked) as run:
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("could not stop", detail)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn(["flatpak", "kill", health.CARLA_APP_ID], [call.args[0] for call in run.call_args_list])
+
+    def test_unproven_backend_exit_never_starts_replacement_engine(self):
+        commands = []
+        def run_checked(args, timeout=15.0):
+            commands.append(list(args))
+            if args[:3] == ["systemctl", "--user", "show"]:
+                return self._completed(args, stdout="LoadState=loaded\n")
+            return self._completed(args)
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend()]), \
+             patch.object(health, "_run_checked", side_effect=run_checked), \
+             patch.object(health, "_wait_until", return_value=False):
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("refusing duplicate launch", detail)
+        self.assertNotIn(["systemctl", "--user", "start", health.CANONICAL_SERVICE], commands)
+
+    def test_flatpak_kill_failure_with_backend_still_alive_never_starts_replacement(self):
+        commands = []
+        def run_checked(args, timeout=15.0):
+            commands.append(list(args))
+            if args[:3] == ["systemctl", "--user", "show"]:
+                return self._completed(args, stdout="LoadState=loaded\n")
+            if args[:2] == ["flatpak", "kill"]:
+                return self._completed(args, returncode=1)
+            return self._completed(args)
+        with patch.object(health, "_b1_expected_active", return_value=True), \
+             patch.object(health, "_carla_processes", return_value=[self._backend()]), \
+             patch.object(health, "_run_checked", side_effect=run_checked):
+            ok, detail = health.restart_carla_safely()
+        self.assertFalse(ok)
+        self.assertIn("Flatpak could not stop", detail)
+        self.assertNotIn(["systemctl", "--user", "start", health.CANONICAL_SERVICE], commands)
+
+
+if __name__ == "__main__":
+    unittest.main()
