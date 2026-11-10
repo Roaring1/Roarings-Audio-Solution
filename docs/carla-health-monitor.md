@@ -88,3 +88,14 @@ A temporary live test opened both PCM taps using a 20 ms requested latency. Appr
 Follow-up code changes reduced the requested tap latency to 10 ms, aligned more closely to one 512-frame graph period, and changed the capture loop to drain every complete paired analysis block instead of allowing a backlog to accumulate. The revised version passes the synthetic and existing regression suites, but **has not yet had a second live acoustic trial**. Keep the observer stopped until a controlled trial confirms it does not increase Scarlett ERR. Do not enable automatic Carla recovery until both live capture safety and crackle-detection sensitivity/false-positive behavior have been validated with real voiced speech and known fault examples.
 
 At the last check the graph was 48 kHz / 1024 frames, the persisted safe quantum was 1024, and the observer had no capture clients open. Do not force the graph back to 512 as part of this work; let the existing xrun policy manage any future downshift.
+
+
+## Live deployment check - November 9, 2026
+
+The repaired patch watcher was installed and restarted successfully. It reads the existing Hearth route configuration and currently confirms B1 enabled / B2 disabled. The four B1 links are present; the two B2 output links remain absent, as configured. This prevents the old default-on B2 patch watcher from racing the router.
+
+The health observer was temporarily started (not enabled at login) with `AUTO_RECOVER=0`. Both `parec` taps connected. After the first buffer-draining revision, the initial backlog warnings did not recur. During a 30-second idle soak, the Scarlett error counter remained at 15, Carla at 0, and B1 at 1. Those are cumulative counters, not new errors during the soak. The graph remained at 512 frames / 48 kHz. The observer used about 52 MiB RSS and approximately 2-3% CPU in the idle snapshot. No audio PCM was written to disk.
+
+The initial 14 -> 15 Scarlett counter increase happened near observer startup; the short subsequent soak was flat. This does not prove the observer caused that single increment, but longer observation during normal voice use is needed to establish that the taps are non-disruptive.
+
+The observer has not yet seen a live voiced-speech test. Idle raw SM7B level is below the detector's voice floor, so the crackle classifier has not been calibrated against a real utterance in this runtime. Notifications for new PipeWire ERR deltas are implemented; automatic Carla restart remains disabled. Do not enable `AUTO_RECOVER=1` until clean voiced speech and a controlled crackle/reference pair have been tested end-to-end.

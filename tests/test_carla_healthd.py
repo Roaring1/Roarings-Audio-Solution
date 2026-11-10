@@ -45,6 +45,17 @@ class CarlaQualityAnalysisTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["candidate"])
 
+    def test_alignment_recovers_carla_delay_and_keeps_clean_signal_valid(self):
+        raw = speech_like()
+        delay = 225
+        processed = [0.0] * delay + [sample * 1.25 for sample in raw[:-delay]]
+        lag, correlation = health._best_alignment(raw, processed)
+        self.assertAlmostEqual(lag, delay, delta=16)
+        self.assertGreater(correlation, 0.95)
+        result = health.analyze_pair(raw, processed)
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["candidate"])
+
     def test_raw_speech_transient_does_not_look_like_output_only_crackle(self):
         raw = speech_like()
         for index in range(2100, 2124):
