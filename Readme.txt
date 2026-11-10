@@ -68,6 +68,39 @@ systemd units in User/. Keep the active unit Environment values in sync with
 the machine's private LAN setup rather than changing the tracked defaults
 without a reason.
 
+LPD8 pad controls and startup defaults
+---------------------------------------
+
+The current original/classic Akai LPD8 layout is:
+
+- Pad 1: mute/unmute the processed B1 microphone path (mic_b1 + b1_mic).
+- Pad 2: mute/unmute both Astro A50 headset outputs (game and chat).
+- Pad 3: show/focus Hearth.
+- Pads 4-7: unassigned by default.
+- Pad 8: toggle the Scarlett desktop-speaker mirror.
+
+For the two mute pads, lit means muted and dark means normal/unmuted. The
+original LPD8 cannot receive ordinary MIDI Note messages to change its pad
+lights from PC state. Its saved pad modes were configured through editor-only
+SysEx: pads 1-2 are Toggle, pads 3-8 are Momentary, in all four stored banks.
+The Hearth UI is the live-state indicator when a mute is changed elsewhere.
+The Hearth Remap choices are filtered to prevent assigning toggle actions to
+momentary pads or momentary actions to toggle pads.
+
+`lpd8-boot-defaults.service` runs at user-manager startup. It starts all VM
+playback buses, both mic buses and the active SM7B/A50 capture paths, both
+headset outputs, the Scarlett output, and the desktop-speaker mirror ON,
+regardless of previous saved mute/marker state. The unrelated LifeCam input is
+left unchanged. It verifies each sink/source state and all six Scarlett monitor
+links. Pad 8 remains a manual toggle after startup; the next reboot restores it
+to ON. The initializer does not stop or restart Carla, the microphone router,
+Moonlight, or Vesktop handling.
+
+The tracked source files are `Bin/lpd8_mixer.sh`,
+`Bin/lpd8_boot_defaults.sh`, `Bin/toggle_scarlett_speakers.sh`,
+`User/lpd8-boot-defaults.service`, and
+`User/lpd8-mixer.service.d/boot-defaults.conf`.
+
 Validation
 ----------
 

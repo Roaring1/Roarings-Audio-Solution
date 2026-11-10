@@ -1,0 +1,15 @@
+[Unit]
+Description=Start all active audio buses, microphone paths, headset and desktop speakers unmuted
+After=pipewire.service pipewire-pulse.service wireplumber.service roaring-vm-sinks.service roaring-mic-busses.service roaring-mic-routesd.service roaring-audio-routesd.service
+Wants=pipewire-pulse.service wireplumber.service roaring-vm-sinks.service roaring-mic-busses.service roaring-mic-routesd.service roaring-audio-routesd.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/lpd8_boot_defaults.sh
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

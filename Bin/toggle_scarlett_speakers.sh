@@ -21,6 +21,7 @@ STATE="$HOME/.cache/roaring_scarlett_loopbacks"
 SOURCES=(vm_game vm_chat vm_music)
 
 notify() {
+  [[ "${ROARING_SILENT:-0}" == "1" ]] && return 0
   command -v notify-send >/dev/null 2>&1 || return 0
   notify-send "Roaring Scarlett Mirror" "$*"
 }

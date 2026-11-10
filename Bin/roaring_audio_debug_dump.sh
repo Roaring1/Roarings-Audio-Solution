@@ -10,7 +10,7 @@ set -euo pipefail
 TS="$(date +%Y%m%d_%H%M%S)"
 OUTDIR="$HOME/Desktop/roaring_debug_$TS"
 TAR="$HOME/Desktop/roaring_debug_$TS.tar.gz"
-CONF="$HOME/.config/roaring_mixer.conf"
+CONF="$HOME/.config/hearth/roaring_mixer.conf"
 
 mkdir -p "$OUTDIR"
 
@@ -24,7 +24,7 @@ ROARING_UNITS=(
   roaring-mic-busses.service
   roaring-mic-routesd.service
   roaring-audio-routesd.service
-  lpd8-mixer.service
+  lpd8-mixer.service lpd8-boot-defaults.service
   roaring-carla-session.service
 )
 
@@ -135,7 +135,7 @@ write_cmd "02_systemd_show.txt" bash -lc '
   for u in \
     pipewire.service pipewire-pulse.service wireplumber.service \
     roaring-vm-sinks.service roaring-mic-busses.service roaring-mic-routesd.service \
-    roaring-carla-session.service; do
+    roaring-carla-session.service lpd8-boot-defaults.service; do
     echo "## $u"
     systemctl --user show "$u" \
       -p ActiveState -p SubState -p ActiveEnterTimestamp \
@@ -218,6 +218,8 @@ write_cmd "10_files_and_hashes.txt" bash -lc '
     "$HOME/bin/roaring_mic_bussesd.sh" \
     "$HOME/bin/roaring_mic_routesd.sh" \
     "$HOME/bin/lpd8_mixer.sh" \
+    "$HOME/bin/lpd8_boot_defaults.sh" \
+    "$HOME/bin/toggle_scarlett_speakers.sh" \
     "$HOME/bin/roaring_restart_everything.sh" \
     "$HOME/bin/roaring_audio_debug_dump.sh" \
     "$HOME/bin/roaring_audio_control.py" \
@@ -234,6 +236,7 @@ write_file_if_exists "$HOME/bin/roaring_vm_sinks.sh"
 write_file_if_exists "$HOME/bin/roaring_mic_bussesd.sh"
 write_file_if_exists "$HOME/bin/roaring_mic_routesd.sh"
 write_file_if_exists "$HOME/bin/lpd8_mixer.sh"
+write_file_if_exists "$HOME/bin/lpd8_boot_defaults.sh"
 write_file_if_exists "$HOME/bin/roaring_restart_everything.sh"
 write_file_if_exists "$HOME/bin/roaring_audio_debug_dump.sh"
 write_file_if_exists "$HOME/bin/roaring_audio_control.py"
@@ -244,6 +247,8 @@ write_file_if_exists "$HOME/.config/systemd/user/roaring-mic-busses.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-mic-routesd.service"
 write_file_if_exists "$HOME/.config/systemd/user/roaring-vm-sinks.service"
 write_file_if_exists "$HOME/.config/systemd/user/lpd8-mixer.service"
+write_file_if_exists "$HOME/.config/systemd/user/lpd8-boot-defaults.service"
+write_file_if_exists "$HOME/.config/systemd/user/lpd8-mixer.service.d/boot-defaults.conf"
 write_file_if_exists "$HOME/bin/roaring_carla_launch.sh"
 write_file_if_exists "$HOME/bin/start_roaring_and_carla.sh"
 write_file_if_exists "$HOME/bin/roaring_toggle_astro_target.sh"
