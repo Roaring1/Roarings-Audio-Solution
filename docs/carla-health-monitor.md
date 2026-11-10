@@ -105,11 +105,29 @@ a bounded runtime. No microphone tap remains open between samples. The
 legacy continuous mode exists only for explicit manual diagnostics:
 roaring_carla_healthd.py --continuous; it is not used by systemd.
 
-## Current rollout notes
+## Live pause status - 2026-11-10
 
-- AUTO_RECOVER=1 is enabled for the intermittent timer only. Recovery is
-  reached exclusively after the repeated-fault classifier gate, then followed
-  by one verification sample.
+The owner is temporarily not using the microphone. The installed sampler has
+therefore been deliberately parked:
+
+- `roaring-carla-healthd.timer` is disabled and inactive.
+- `roaring-carla-healthd.service` is stopped/inactive; no sample is running.
+- `AUTO_RECOVER=0` in the local runtime config, so manually starting a sample
+  cannot trigger automatic Carla recovery during this break.
+- The installed script, service, timer, numeric history, and state files are
+  retained. No PCM files are created or need cleanup.
+- The separate `roaring-carla-watchd.service` remains active only to maintain
+  Carla patchbay links. It does not open microphone capture taps.
+
+This is a temporary runtime pause, not a code or configuration deletion.
+When microphone use resumes, inspect current B1 routing and Carla ownership
+first, then explicitly re-enable sampling. Keep automatic recovery disabled
+until the acoustic and process-ownership acceptance tests are complete.
+
+## Initial rollout notes - 2026-11-09
+
+- At initial rollout, AUTO_RECOVER=1 was enabled for the intermittent timer
+  only. This historical setting is superseded by the live pause status above.
 - Existing live checks show one Carla backend, expected B1 links, 48 kHz /
   512-frame graph, Scarlett ERR=15, B1 ERR=1, Carla ERR=0. These are cumulative
   PipeWire counters; no new increments were observed in the last check.
